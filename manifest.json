@@ -2,7 +2,7 @@
   "name": "RotationLock",
   "version": "1.0.0",
   "author": "dcqwqc",
-  "homepage": "https://github.com/dcqwqc/caelestia-plugin-rotation-lock",
+  "homepage": "https://github.com/dcqwqc/CaelestiaPlugin-RotationLock",
   "icon": "screen_rotation",
   "description": "Convertible laptop support: auto-rotation, tablet mode, on-screen keyboard and rotation lock, fully owned by this plugin.",
   "entryPoints": [

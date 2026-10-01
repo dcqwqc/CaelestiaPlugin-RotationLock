@@ -31,7 +31,7 @@ than a guess at it, so the shape is the real one.
 
 Clone into Caelestia's plugin directory:
 
-    git clone https://github.com/dcqwqc/caelestia-plugin-rotation-lock ~/.local/share/caelestia/plugins/rotation-lock
+    git clone https://github.com/dcqwqc/CaelestiaPlugin-RotationLock ~/.local/share/caelestia/plugins/rotation-lock
 
 Or clone anywhere and add the parent to `path` in
 `~/.config/caelestia/plugins.json`.
