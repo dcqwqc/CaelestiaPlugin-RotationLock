@@ -1,15 +1,21 @@
 {
   "name": "RotationLock",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "author": "dcqwqc",
   "homepage": "https://github.com/dcqwqc/caelestia-plugin-rotation-lock",
   "icon": "screen_rotation",
-  "description": "Rotation lock for a convertible, as owned by the yoga-tablet daemon. Hides itself where the daemon is not running.",
+  "description": "Convertible laptop support: auto-rotation, tablet mode, on-screen keyboard and rotation lock, fully owned by this plugin.",
   "entryPoints": [
+    {
+      "type": "custom",
+      "source": "Main.qml"
+    },
     {
       "type": "quick-toggle",
       "source": "toggles/RotationLockToggle.qml",
-      "properties": { "name": "rotationLock" }
+      "properties": {
+        "name": "rotationLock"
+      }
     }
   ]
 }

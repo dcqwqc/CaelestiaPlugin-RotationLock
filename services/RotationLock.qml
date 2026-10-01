@@ -17,7 +17,7 @@ Singleton {
     // carry ~/.local/bin, so `yoga-tablet` cannot be resolved by name from
     // here -- exec'ing it by name fails with ENOENT at login and silently
     // hides the toggle. Same reason RemoteStatus spells kagami-remote out.
-    readonly property string bin: `${Quickshell.env("HOME")}/.local/bin/yoga-tablet`
+    readonly property string bin: `${Quickshell.env("HOME")}/.local/share/caelestia/plugins/rotation-lock/scripts/yoga-tablet`
 
     // False until a reply actually lands, so the toggle stays hidden on a
     // machine where the daemon is not installed or not running.

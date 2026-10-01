@@ -1,0 +1,1448 @@
+#!/usr/bin/env python3
+"""yoga-tablet - convertible support for Hyprland on the Lenovo Yoga 7 2-in-1.
+
+Three things the compositor does not do on its own:
+
+  * Accelerometer-driven rotation of the internal panel through all four
+    orientations, applied to the output *and* to the touchscreen and pen
+    digitizers so that touch stays aligned with what is on screen.
+  * A reaction to the "Lenovo Yoga Tablet Mode Control switch" (the hinge
+    passing ~190 deg), which is what folding the keyboard away reports.
+  * An on-screen keyboard, so the machine stays usable once the physical
+    keyboard is folded underneath and deactivated.
+
+Hyprland 0.56 with a Lua config rejects `hyprctl keyword` ("keyword can't
+work with non-legacy parsers"), so every compositor change is issued as a
+generated Lua chunk through `hyprctl eval`.
+
+The daemon polls the IIO accelerometer directly rather than going through
+iio-sensor-proxy: the raw sysfs attributes are world-readable, which keeps
+the dependency list short and puts the hysteresis policy here where it can
+be tuned.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import signal
+import socket
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+
+APP = "yoga-tablet"
+
+CONFIG_PATH = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / APP / "config.json"
+RUNTIME_DIR = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"))
+SOCKET_PATH = RUNTIME_DIR / f"{APP}.sock"
+# Read by Caelestia's Osk service. Its drawer window spans the whole screen and
+# ignores exclusive zones, so it cannot see the keyboard the way ordinary
+# windows do and needs to be handed the number.
+OSK_STATE_PATH = RUNTIME_DIR / f"{APP}-osk.json"
+IIO_ROOT = Path("/sys/bus/iio/devices")
+# Caelestia rewrites this whenever the colour scheme or light/dark mode changes.
+SCHEME_PATH = (
+    Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state"))
+    / "caelestia"
+    / "scheme.json"
+)
+
+# wvkbd colour flag -> Material You role. Normal keys sit above the body and
+# special keys sink back into it, which is the usual phone-keyboard hierarchy.
+THEME_MAP = (
+    # The exact colour Caelestia paints its own panels with (ContentWindow's
+    # surfaceColour is tPalette.m3surface), so the keyboard reads as one more
+    # panel rather than as a slightly-off imitation of one.
+    ("--bg", "surface"),
+    ("--fg", "surfaceContainerHigh"),
+    ("--fg-sp", "surfaceContainer"),
+    ("--text", "onSurface"),
+    ("--text-sp", "onSurfaceVariant"),
+    # Neutral grey feedback: outlineVariant is the palette's plain mid grey,
+    # so a keypress reads as a press rather than as an accent.
+    ("--press", "outlineVariant"),
+    ("--press-sp", "outlineVariant"),
+    ("--text-press", "onSurface"),
+    ("--text-press-sp", "onSurface"),
+    ("--swipe", "outline"),
+    ("--swipe-sp", "outline"),
+    ("--text-swipe", "surfaceContainerLowest"),
+    ("--text-swipe-sp", "surfaceContainerLowest"),
+)
+
+
+def scheme_colours() -> dict | None:
+    """Current Caelestia palette, or None if it cannot be read."""
+    try:
+        with SCHEME_PATH.open() as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    colours = data.get("colours")
+    return colours if isinstance(colours, dict) else None
+
+
+def theme_args(cfg: dict) -> list[str]:
+    """wvkbd arguments that match the desktop's current colour scheme."""
+    if cfg.get("osk_theme") != "caelestia":
+        return []
+    colours = scheme_colours()
+    if not colours:
+        log("no Caelestia scheme found; leaving the keyboard unthemed")
+        return []
+    args: list[str] = []
+    for flag, role in THEME_MAP:
+        value = colours.get(role)
+        if isinstance(value, str) and value:
+            args += [flag, value.lstrip("#")]
+    font = cfg.get("osk_font")
+    if font:
+        args += ["--fn", str(font)]
+    rounding = cfg.get("osk_rounding")
+    if rounding not in (None, ""):
+        args += ["-R", str(int(rounding))]
+    return args
+
+# Wayland output transforms.
+NORMAL, ROT_90, ROT_180, ROT_270 = 0, 1, 2, 3
+
+ORIENTATION_TRANSFORM = {
+    "normal": NORMAL,
+    "left-up": ROT_90,
+    "bottom-up": ROT_180,
+    "right-up": ROT_270,
+}
+TRANSFORM_ORIENTATION = {transform: orientation for orientation, transform in ORIENTATION_TRANSFORM.items()}
+
+DEFAULTS = {
+    # Which panel to rotate. "auto" picks the first internal (eDP-*) output.
+    "monitor": "auto",
+    # "always" | "tablet" (only while folded) | "never"
+    "auto_rotate": "always",
+    "poll_interval": 0.25,
+    # Fraction of g along an axis needed to commit to that side.
+    "threshold_g": 0.55,
+    # Above this much g on the z axis the device is lying flat and the
+    # x/y readings are noise, so the current orientation is held.
+    "flat_threshold_g": 0.80,
+    # Consecutive agreeing samples before a rotation is applied.
+    "stable_samples": 4,
+    # Set true if 90 and 270 come out swapped for your panel's mount matrix.
+    "invert_sides": False,
+    # Deliberately no --auto: the keyboard appears only when asked for, never
+    # because a text field happened to take focus. -L/-H are the landscape and
+    # portrait heights in logical pixels.
+    "osk_command": [
+        "wvkbd-mobintl",
+        "--hidden",
+        # The magnified key-preview bubble is a phone affordance; on a screen
+        # this size it just flashes over the layout. Drop "--no-popup" from
+        # osk_command to get it back.
+        "--no-popup",
+        # The keyboard deliberately claims an exclusive zone, so windows resize
+        # around it instead of being covered by it -- the screen simply gets
+        # shorter while it is up. Caelestia's drawers are ExclusionMode.Ignore
+        # and have to be told separately; that is what OSK_STATE_PATH is for.
+        "-L", "340",
+        "-H", "500",
+    ],
+    # Colour the keyboard from the live Caelestia scheme. "none" leaves
+    # osk_command untouched so the wvkbd defaults apply.
+    "osk_theme": "caelestia",
+    "osk_font": "Rubik 14",
+    "osk_rounding": 15,
+    "osk_extra_args": [],
+    # Both need the locally built wvkbd (yoga-wvkbd-build); they are dropped
+    # silently when running against a stock one, which does not know them.
+    #
+    # Upstream lays the keys out edge to edge and then insets each one by
+    # KBD_KEY_BORDER, so the outermost keys sit half as far from the edge of
+    # the keyboard as they do from each other. This is the margin around the
+    # whole grid that fixes that.
+    "osk_padding": 8,
+    # An overlay remains reachable over a true fullscreen window. Do not fake
+    # that by changing the application's fullscreen state: doing so couples two
+    # independent controls and makes hiding the keyboard alter the window.
+    "osk_layer": "overlay",
+    # Start it hidden on fold so the first toggle is instant. It stays
+    # invisible until something explicitly shows it.
+    "osk_preload_in_tablet": True,
+    # The bottom-left grab strip that opens the keyboard. See the Handle class
+    # for why the gesture cannot simply be bound in hyprgrass.
+    "osk_handle": True,
+    # Wide enough to hit without looking. It starts clear of Caelestia's left
+    # bar (which reserves 60px) and stops well short of the launcher in the
+    # centre of the bottom edge.
+    "osk_handle_left": 68,
+    "osk_handle_width": 190,
+    "osk_handle_height": 26,
+    "osk_handle_threshold": 18,
+    # Off by default. The firmware already cuts the keyboard and touchpad when
+    # the hinge folds, so having the compositor disable them too buys nothing
+    # and risks stranding the machine with a dead keyboard if the un-fold event
+    # is ever missed. Only turn this on if your firmware does not do it.
+    "disable_pointers_in_tablet": False,
+    "notify": True,
+}
+
+
+def log(msg: str) -> None:
+    print(f"[{APP}] {msg}", flush=True)
+
+
+def load_config() -> dict:
+    cfg = dict(DEFAULTS)
+    try:
+        with CONFIG_PATH.open() as fh:
+            user = json.load(fh)
+        if isinstance(user, dict):
+            cfg.update(user)
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError) as exc:
+        log(f"ignoring unreadable config {CONFIG_PATH}: {exc}")
+    return cfg
+
+
+def save_config(cfg: dict) -> None:
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp = CONFIG_PATH.with_suffix(".tmp")
+    with tmp.open("w") as fh:
+        json.dump(cfg, fh, indent=2)
+        fh.write("\n")
+    tmp.replace(CONFIG_PATH)
+
+
+def toast(title: str, body: str, icon: str, level: str) -> bool:
+    """Post to Caelestia's own toast stack. True if the shell took it.
+
+    These are the shell's system-level messages -- the bottom-right stack the
+    battery, VPN, game mode and audio-device services use (Shortcuts.qml
+    exposes it as the "toaster" IPC target). Folding the machine into a tablet
+    belongs there: it is a state change you glance at and forget, not an
+    application notification worth keeping in the top-right list.
+    """
+    if level not in ("info", "success", "warn", "error"):
+        level = "info"
+    try:
+        proc = subprocess.run(
+            ["qs", "-c", "caelestia", "ipc", "call", "toaster", level, title, body, icon],
+            check=False,
+            timeout=3,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return proc.returncode == 0
+
+
+def notify(
+    cfg: dict,
+    title: str,
+    body: str = "",
+    icon: str = "tablet_android",
+    level: str = "info",
+) -> None:
+    if not cfg.get("notify", True):
+        return
+    # Falls back to a plain desktop notification whenever the shell is not
+    # up -- during a shell restart, or if Caelestia is not the shell at all.
+    if cfg.get("notify_backend", "toast") == "toast" and toast(title, body, icon, level):
+        return
+    try:
+        subprocess.run(
+            ["notify-send", "-a", APP, "-t", "2000", title, body],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except FileNotFoundError:
+        pass
+
+
+# --------------------------------------------------------------------------
+# Hyprland
+# --------------------------------------------------------------------------
+
+
+def hyprctl_json(what: str):
+    try:
+        out = subprocess.run(
+            ["hyprctl", "-j", what], capture_output=True, text=True, timeout=5
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        log(f"hyprctl {what} failed: {exc}")
+        return None
+    if out.returncode != 0:
+        log(f"hyprctl {what} exited {out.returncode}: {out.stderr.strip()}")
+        return None
+    try:
+        return json.loads(out.stdout)
+    except ValueError as exc:
+        log(f"hyprctl {what} returned unparseable JSON: {exc}")
+        return None
+
+
+def hypr_eval_lua(chunk: str) -> bool:
+    """Run a Lua chunk inside the compositor.
+
+    `hyprctl eval` takes the code as a single argv string, which makes
+    quoting brittle for anything non-trivial, so the chunk goes to a file
+    in the runtime dir and Hyprland is asked to dofile() it.
+    """
+    path = RUNTIME_DIR / f"{APP}-chunk.lua"
+    try:
+        path.write_text(chunk)
+    except OSError as exc:
+        log(f"cannot stage Lua chunk: {exc}")
+        return False
+    try:
+        out = subprocess.run(
+            ["hyprctl", "eval", f"dofile('{path}')"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        log(f"hyprctl eval failed: {exc}")
+        return False
+    reply = (out.stdout or "").strip()
+    if out.returncode != 0 or reply.startswith("error"):
+        log(f"hyprctl eval rejected chunk: {reply or out.stderr.strip()}")
+        return False
+    return True
+
+
+def lua_str(value: str) -> str:
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+OSK_NAMESPACE = "wvkbd"
+
+
+def layer_top(mon_name: str, namespace: str) -> int | None:
+    """Y of a mapped layer surface's top edge, or None if it is not on screen."""
+    data = hyprctl_json("layers")
+    if not isinstance(data, dict):
+        return None
+
+    mon = data.get(mon_name)
+    if not mon:
+        return None
+
+    for surfaces in (mon.get("levels") or {}).values():
+        for surface in surfaces:
+            if surface.get("namespace") == namespace:
+                y, height = surface.get("y"), surface.get("h")
+                if isinstance(y, int) and isinstance(height, int) and height > 0:
+                    return y
+    return None
+
+
+def logical_height(mon: dict | None) -> int | None:
+    """Output height in the coordinate space layer surfaces are placed in."""
+    if not mon:
+        return None
+    try:
+        width = int(mon["width"]) / float(mon["scale"])
+        height = int(mon["height"]) / float(mon["scale"])
+    except (KeyError, TypeError, ValueError, ZeroDivisionError):
+        return None
+    # A 90 or 270 degree transform swaps the axes.
+    return round(width if int(mon.get("transform", 0)) % 2 else height)
+
+
+def pick_monitor(cfg: dict):
+    monitors = hyprctl_json("monitors")
+    if not monitors:
+        return None
+    want = cfg.get("monitor", "auto")
+    if want and want != "auto":
+        for mon in monitors:
+            if mon.get("name") == want:
+                return mon
+        log(f"configured monitor {want!r} not present; falling back to internal")
+    for mon in monitors:
+        if str(mon.get("name", "")).lower().startswith("edp"):
+            return mon
+    return monitors[0]
+
+
+def digitizer_names() -> list[str]:
+    """Touchscreen and pen devices, which must follow the panel transform."""
+    devices = hyprctl_json("devices")
+    if not devices:
+        return []
+    names = []
+    for group in ("touch", "tablets"):
+        for dev in devices.get(group) or []:
+            name = dev.get("name")
+            if name:
+                names.append(name)
+    return names
+
+
+def pointer_names() -> list[str]:
+    """Built-in touchpad and the laptop's own keyboard."""
+    devices = hyprctl_json("devices")
+    if not devices:
+        return []
+    names = []
+    for dev in devices.get("mice") or []:
+        name = dev.get("name") or ""
+        if "touchpad" in name or "elan" in name:
+            names.append(name)
+    for dev in devices.get("keyboards") or []:
+        name = dev.get("name") or ""
+        if "at-translated-set-2-keyboard" in name:
+            names.append(name)
+    return names
+
+
+# --------------------------------------------------------------------------
+# On-screen keyboard
+# --------------------------------------------------------------------------
+
+
+class Osk:
+    """Supervises wvkbd.
+
+    wvkbd stays resident and is shown/hidden with SIGUSR2/SIGUSR1 so that
+    toggling does not pay layer-shell startup cost. If the signals turn out
+    not to be supported by the installed build, `fallback_restart` makes
+    show/hide degrade to starting and stopping the process instead.
+    """
+
+    def __init__(self, cfg: dict):
+        self.cfg = cfg
+        self.proc: subprocess.Popen | None = None
+        self.visible = False
+        self.fallback_restart = False
+        self._flags: set[str] | None = None
+
+    @property
+    def binary(self) -> str:
+        """The wvkbd to run, preferring the locally built one.
+
+        A systemd user service does not get ~/.local/bin on its PATH, so the
+        patched build has to be looked for by hand or the distribution's would
+        win and quietly lose the padding and the layer.
+        """
+        name = str((self.cfg.get("osk_command") or DEFAULTS["osk_command"])[0])
+        local = Path.home() / ".local" / "bin" / name
+        if local.is_file() and os.access(local, os.X_OK):
+            return str(local)
+        return name
+
+    def supported_flags(self) -> set[str]:
+        """Flags the wvkbd actually on disk understands.
+
+        wvkbd exits with its usage message on an argument it does not know, so
+        handing a stock build the local ones would stop the keyboard starting
+        at all rather than merely looking plain.
+        """
+        if self._flags is None:
+            try:
+                proc = subprocess.run(
+                    [self.binary, "-h"], capture_output=True, text=True, timeout=5
+                )
+                text = (proc.stderr or "") + (proc.stdout or "")
+            except (OSError, subprocess.SubprocessError):
+                text = ""
+            self._flags = set(re.findall(r"--?[A-Za-z][\w-]*", text))
+        return self._flags
+
+    def local_args(self) -> list[str]:
+        flags = self.supported_flags()
+        args: list[str] = []
+        padding = self.cfg.get("osk_padding")
+        if padding not in (None, "") and "-P" in flags:
+            args += ["-P", str(int(padding))]
+        layer = self.cfg.get("osk_layer")
+        if layer and "--layer" in flags:
+            args += ["--layer", str(layer)]
+        return args
+
+    @property
+    def command(self) -> list[str]:
+        base = list(self.cfg.get("osk_command") or DEFAULTS["osk_command"])
+        cmd = [self.binary] + [str(a) for a in base[1:]]
+        cmd += theme_args(self.cfg)
+        cmd += self.local_args()
+        cmd += [str(a) for a in (self.cfg.get("osk_extra_args") or [])]
+        return cmd
+
+    def available(self) -> bool:
+        from shutil import which
+
+        return which(self.command[0]) is not None
+
+    def _alive(self) -> bool:
+        return self.proc is not None and self.proc.poll() is None
+
+    def _spawn(self, hidden: bool) -> str | None:
+        cmd = self.command
+        if not hidden:
+            cmd = [c for c in cmd if c != "--hidden"]
+        try:
+            self.proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                start_new_session=True,
+            )
+        except FileNotFoundError:
+            return f"{cmd[0]} is not installed"
+        except OSError as exc:
+            return f"cannot start {cmd[0]}: {exc}"
+
+        # A rejected flag makes wvkbd exit immediately, which would otherwise
+        # look exactly like a keyboard that silently refuses to appear.
+        try:
+            self.proc.wait(timeout=0.4)
+        except subprocess.TimeoutExpired:
+            return None
+        err = ""
+        if self.proc.stderr is not None:
+            try:
+                err = self.proc.stderr.read().decode(errors="replace").strip()
+            except OSError:
+                pass
+        rc = self.proc.returncode
+        self.proc = None
+        return f"{cmd[0]} exited immediately (status {rc}): {err or 'no output'}"
+
+    def start(self) -> str | None:
+        if self._alive():
+            return None
+        return self._spawn(hidden=True)
+
+    def stop(self) -> None:
+        if self._alive():
+            assert self.proc is not None
+            self.proc.terminate()
+            try:
+                self.proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+        self.proc = None
+        self.visible = False
+
+    def _signal(self, sig: int) -> bool:
+        if not self._alive():
+            return False
+        try:
+            assert self.proc is not None
+            self.proc.send_signal(sig)
+            return True
+        except OSError:
+            return False
+
+    def show(self) -> str | None:
+        if self.fallback_restart:
+            self.stop()
+            err = self._spawn(hidden=False)
+            if err:
+                return err
+            self.visible = True
+            return None
+        err = self.start()
+        if err:
+            return err
+        if not self._signal(signal.SIGUSR2):
+            return "on-screen keyboard is not running"
+        self.visible = True
+        return None
+
+    def hide(self) -> str | None:
+        if self.fallback_restart:
+            self.stop()
+            return self.start()
+        if self._alive():
+            self._signal(signal.SIGUSR1)
+        self.visible = False
+        return None
+
+    def toggle(self) -> str | None:
+        if self.fallback_restart:
+            return self.hide() if self.visible else self.show()
+        err = self.start()
+        if err:
+            return err
+        # SIGRTMIN toggles, so wvkbd stays the authority on its own
+        # visibility. That matters with --auto, where it also shows and
+        # hides itself and our local flag would otherwise drift.
+        if not self._signal(signal.SIGRTMIN):
+            return "on-screen keyboard is not running"
+        self.visible = not self.visible
+        return None
+
+    def reflow(self) -> None:
+        """Rebuild the keyboard after a rotation so it re-lays out."""
+        if not self._alive():
+            return
+        was_visible = self.visible
+        self.stop()
+        self.start()
+        if was_visible:
+            self.show()
+
+
+class Handle:
+    """The bottom-left strip that pulls the keyboard up.
+
+    hyprgrass cannot express this gesture. Its edge binds carry only an edge
+    bitmask -- find_swipe_edges() reports which edges a swipe started near and
+    nothing about where along them -- and its Lua API refuses a combined
+    origin outright, so a corner is not bindable either. The smallest thing it
+    can match is a whole edge, and the bottom edge is already Caelestia's: the
+    launcher owns the centre and utilities the right corner.
+
+    So this does the region test the way Caelestia does, in QML: a small
+    layer-shell window sitting in exactly the dead space at the bottom-left,
+    on the overlay layer so it is above caelestia-drawers. It runs only in
+    tablet mode, and only while the keyboard is hidden, so it can never end up
+    covering wvkbd's own bottom-left keys.
+    """
+
+    PLUGIN_ROOT = Path(__file__).resolve().parent.parent
+    CONFIG_DIR = PLUGIN_ROOT / "osk"
+
+    def __init__(self, cfg: dict):
+        self.cfg = cfg
+        self.proc: subprocess.Popen | None = None
+        self.state: tuple[str, int] | None = None
+
+    def available(self) -> bool:
+        from shutil import which
+
+        if not which("qs"):
+            return False
+        return (self.CONFIG_DIR / "shell.qml").exists()
+
+    def _alive(self) -> bool:
+        return self.proc is not None and self.proc.poll() is None
+
+    def _env(self, monitor: str | None, mode: str, bottom: int) -> dict:
+        env = dict(os.environ)
+        env["YOGA_HANDLE_BIN"] = str(Path(sys.argv[0]).resolve())
+        env["YOGA_HANDLE_OUTPUT"] = monitor or ""
+        env["YOGA_HANDLE_MODE"] = mode
+        env["YOGA_HANDLE_BOTTOM"] = str(bottom)
+        env["YOGA_HANDLE_LEFT"] = str(self.cfg.get("osk_handle_left", 68))
+        env["YOGA_HANDLE_WIDTH"] = str(self.cfg.get("osk_handle_width", 190))
+        env["YOGA_HANDLE_HEIGHT"] = str(self.cfg.get("osk_handle_height", 26))
+        env["YOGA_HANDLE_THRESHOLD"] = str(self.cfg.get("osk_handle_threshold", 18))
+        # Same neutral greys the keypress highlight uses, for the same reason:
+        # this is furniture, not an accent.
+        colours = scheme_colours() or {}
+        for var, role in (
+            ("YOGA_HANDLE_COLOUR", "outlineVariant"),
+            ("YOGA_HANDLE_COLOUR_ACTIVE", "onSurfaceVariant"),
+        ):
+            value = colours.get(role)
+            if isinstance(value, str) and value:
+                env[var] = "#" + value.lstrip("#")
+        return env
+
+    def start(self, monitor: str | None, mode: str = "open", bottom: int = 0) -> None:
+        if not self.cfg.get("osk_handle", True):
+            return
+        # The QML reads its mode and position from the environment at spawn, so
+        # moving the strip onto the keyboard means restarting it. That costs a
+        # few hundred milliseconds, which nobody notices behind a keyboard that
+        # is already sliding.
+        if self._alive():
+            if (mode, bottom) == self.state:
+                return
+            self.stop()
+        if not self.available():
+            log("no quickshell handle config found; keyboard handle disabled")
+            return
+        try:
+            self.proc = subprocess.Popen(
+                ["qs", "-p", str(self.CONFIG_DIR)],
+                env=self._env(monitor, mode, bottom),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            self.state = (mode, bottom)
+        except OSError as exc:
+            log(f"could not start the keyboard handle: {exc}")
+            self.proc = None
+
+    def stop(self) -> None:
+        if self._alive():
+            assert self.proc is not None
+            self.proc.terminate()
+            try:
+                self.proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+        self.proc = None
+        self.state = None
+
+
+# --------------------------------------------------------------------------
+# Daemon
+# --------------------------------------------------------------------------
+
+
+class Accelerometer:
+    def __init__(self, cfg: dict):
+        self.cfg = cfg
+        self.base: Path | None = None
+        self.scale = 1.0
+        self.rediscover()
+
+    def rediscover(self) -> None:
+        self.base = self._find(self.cfg)
+        self.scale = 1.0
+        if self.base is not None:
+            try:
+                self.scale = float((self.base / "in_accel_scale").read_text().strip())
+            except (OSError, ValueError):
+                self.scale = 1.0
+
+    @staticmethod
+    def _find(cfg: dict) -> Path | None:
+        want = cfg.get("accel_device", "auto")
+        if want and want != "auto":
+            path = Path(want)
+            return path if path.is_dir() else None
+        try:
+            candidates = sorted(IIO_ROOT.glob("iio:device*"))
+        except OSError:
+            return None
+        for dev in candidates:
+            try:
+                if (dev / "name").read_text().strip() == "accel_3d":
+                    return dev
+            except OSError:
+                continue
+        for dev in candidates:
+            if (dev / "in_accel_x_raw").exists():
+                return dev
+        return None
+
+    def read_g(self) -> tuple[float, float, float] | None:
+        """Return the gravity vector in g, or None if the sensor went away."""
+        if self.base is None:
+            return None
+        try:
+            raw = [
+                int((self.base / f"in_accel_{axis}_raw").read_text().strip())
+                for axis in ("x", "y", "z")
+            ]
+        except (OSError, ValueError):
+            return None
+        # in_accel_scale converts raw counts to m/s^2.
+        return tuple(v * self.scale / 9.80665 for v in raw)  # type: ignore[return-value]
+
+
+class Daemon:
+    def __init__(self, cfg: dict):
+        self.cfg = cfg
+        self.accel = Accelerometer(cfg)
+        self.osk = Osk(cfg)
+        self.grab = Handle(cfg)
+        self.lock = threading.RLock()
+        self.stopping = threading.Event()
+
+        self.tablet_mode = False
+        # Windows temporarily fitted above the keyboard, keyed by address and
+        # carrying the fullscreen mode originally reported to the client.
+        self._keyboard_fit_windows: dict[str, int] = {}
+        self._keyboard_original_frame: tuple[str, int] | None = None
+        self.rotation_locked = False
+        self.transform = self._current_transform()
+        # Start from the compositor's real state. Otherwise an unlock shortly
+        # after daemon startup can use the synthetic "normal" value and undo a
+        # valid portrait transform before the sensor loop has settled.
+        self.orientation = TRANSFORM_ORIENTATION.get(self.transform, "normal")
+        self._candidate: str | None = None
+        self._candidate_hits = 0
+        # Last measured keyboard offset, per orientation.
+        self._osk_offsets: dict[int, int] = {}
+
+    # -- compositor state ---------------------------------------------------
+
+    def _current_transform(self) -> int:
+        mon = pick_monitor(self.cfg)
+        if not mon:
+            return NORMAL
+        try:
+            return int(mon.get("transform", 0)) % 4
+        except (TypeError, ValueError):
+            return NORMAL
+
+    def apply_transform(self, transform: int, reason: str = "") -> str | None:
+        transform %= 4
+        mon = pick_monitor(self.cfg)
+        if not mon:
+            return "no monitor available"
+        name = mon.get("name")
+        scale = mon.get("scale", 1)
+        x, y = mon.get("x", 0), mon.get("y", 0)
+
+        lines = [
+            "hl.monitor({{ output = {out}, mode = \"preferred\", "
+            "position = {pos}, scale = {scale}, transform = {t} }})".format(
+                out=lua_str(str(name)),
+                pos=lua_str(f"{x}x{y}"),
+                scale=float(scale),
+                t=transform,
+            )
+        ]
+        # The digitizers are physically bonded to the panel, so they need the
+        # same transform or touch lands in the wrong place once rotated.
+        for dev in digitizer_names():
+            lines.append(
+                f"hl.device({{ name = {lua_str(dev)}, transform = {transform} }})"
+            )
+
+        if not hypr_eval_lua("\n".join(lines) + "\n"):
+            return "compositor rejected the rotation"
+
+        self.transform = transform
+        log(f"transform -> {transform * 90} deg{' (' + reason + ')' if reason else ''}")
+        self.osk.reflow()
+        # Portrait and landscape keyboards are different heights, so the strip
+        # has to be re-placed on top of the new one.
+        self.sync_handle()
+        return None
+
+    def set_pointers_enabled(self, enabled: bool, force: bool = False) -> None:
+        # force is used when re-enabling: a restore has to run even when the
+        # feature is switched off now, because an earlier run (or an older
+        # config) may have left devices disabled.
+        if not force and not self.cfg.get("disable_pointers_in_tablet", False):
+            return
+        names = pointer_names()
+        if not names:
+            return
+        flag = "true" if enabled else "false"
+        chunk = "\n".join(
+            f"hl.device({{ name = {lua_str(n)}, enabled = {flag} }})" for n in names
+        )
+        hypr_eval_lua(chunk + "\n")
+
+    # -- policy -------------------------------------------------------------
+
+    def rotation_active(self) -> bool:
+        if self.rotation_locked:
+            return False
+        mode = self.cfg.get("auto_rotate", "always")
+        if mode == "never":
+            return False
+        if mode == "tablet":
+            return self.tablet_mode
+        return True
+
+    def orientation_from(self, g: tuple[float, float, float]) -> str:
+        x, y, z = g
+        thr = float(self.cfg.get("threshold_g", 0.55))
+        flat = float(self.cfg.get("flat_threshold_g", 0.80))
+
+        # Face up or face down: the in-plane component is too small to tell
+        # which way round the device is, so keep whatever we already have.
+        if abs(z) > flat and abs(x) < thr and abs(y) < thr:
+            return self.orientation
+
+        if abs(y) >= abs(x):
+            if y <= -thr:
+                return "normal"
+            if y >= thr:
+                return "bottom-up"
+        else:
+            if x >= thr:
+                return "left-up" if not self.cfg.get("invert_sides") else "right-up"
+            if x <= -thr:
+                return "right-up" if not self.cfg.get("invert_sides") else "left-up"
+        return self.orientation
+
+    def sample_orientation(self) -> str:
+        """Refresh orientation synchronously for user-triggered unlocks."""
+        g = self.accel.read_g()
+        if g is not None:
+            self.orientation = self.orientation_from(g)
+        self._candidate, self._candidate_hits = None, 0
+        return self.orientation
+
+    def poll_loop(self) -> None:
+        if self.accel.base is None:
+            log("no accelerometer found; rotation disabled")
+            return
+        log(f"accelerometer: {self.accel.base}")
+        interval = float(self.cfg.get("poll_interval", 0.25))
+        need = int(self.cfg.get("stable_samples", 4))
+
+        while not self.stopping.wait(interval):
+            g = self.accel.read_g()
+            if g is None:
+                continue
+            with self.lock:
+                candidate = self.orientation_from(g)
+                if candidate == self.orientation:
+                    self._candidate, self._candidate_hits = None, 0
+                    continue
+                # Require the new reading to persist, so that carrying the
+                # machine around does not spin the display.
+                if candidate == self._candidate:
+                    self._candidate_hits += 1
+                else:
+                    self._candidate, self._candidate_hits = candidate, 1
+                if self._candidate_hits < need:
+                    continue
+                self._candidate, self._candidate_hits = None, 0
+                self.orientation = candidate
+                if not self.rotation_active():
+                    continue
+                target = ORIENTATION_TRANSFORM[candidate]
+                if target != self.transform:
+                    self.apply_transform(target, reason=candidate)
+
+    # -- commands -----------------------------------------------------------
+
+    def osk_offset(self, mon: dict | None) -> int:
+        """How far off the bottom of the screen the keyboard's top edge sits.
+
+        Measured rather than calculated, because wvkbd's height is not the
+        answer: it honours the 10px Caelestia reserves along the bottom, so it
+        floats clear of the screen edge, while the strip -- which ignores
+        exclusive zones -- does not. Taking the top edge directly sidesteps the
+        whole question. wvkbd maps a moment after the show signal, hence the
+        short wait; the height flags are only a fallback for when it never
+        turns up at all.
+        """
+        screen = logical_height(mon)
+        if screen:
+            mon_name = mon.get("name") if mon else ""
+            for _ in range(8):
+                top = layer_top(mon_name, OSK_NAMESPACE)
+                if top is not None:
+                    return max(0, screen - top)
+                time.sleep(0.1)
+        cmd = [str(a) for a in (self.cfg.get("osk_command") or DEFAULTS["osk_command"])]
+        flag = "-H" if self.transform % 2 else "-L"
+        try:
+            return max(1, int(cmd[cmd.index(flag) + 1]))
+        except (ValueError, IndexError):
+            return 340
+
+    def set_fullscreen_state(self, address: str, internal: int, client: int) -> bool:
+        """Set both fullscreen modes on one window without stealing focus."""
+        if not re.fullmatch(r"0x[0-9a-fA-F]+", address):
+            return False
+        target = lua_str(f"address:{address}")
+        return hypr_eval_lua(
+            "hl.dispatch(hl.dsp.window.fullscreen_state({ "
+            f"internal = {internal}, client = {client}, action = \"set\", "
+            f"window = {target} }}))\n"
+        )
+
+    @staticmethod
+    def gap_lua(value: str) -> str | None:
+        """Turn Hyprland's CSS-gap display value back into a Lua value."""
+        parts = value.split()
+        if len(parts) == 1 and re.fullmatch(r"-?\d+", parts[0]):
+            return parts[0]
+        if len(parts) == 4 and all(re.fullmatch(r"-?\d+", part) for part in parts):
+            return (
+                f"{{ top = {parts[0]}, right = {parts[1]}, "
+                f"bottom = {parts[2]}, left = {parts[3]} }}"
+            )
+        return None
+
+    def set_keyboard_frame(self, flush: bool) -> None:
+        """Make only the fitted fullscreen frame edge-to-edge, then restore it."""
+        if flush:
+            if self._keyboard_original_frame is not None:
+                return
+            gaps = hyprctl_json("getoption general:gaps_out")
+            border = hyprctl_json("getoption general:border_size")
+            if not isinstance(gaps, dict) or not isinstance(border, dict):
+                return
+            css = gaps.get("css")
+            size = border.get("int")
+            if not isinstance(css, str) or not isinstance(size, int):
+                return
+            self._keyboard_original_frame = (css, size)
+            hypr_eval_lua(
+                "hl.config({ general = { gaps_out = 0, border_size = 0 } })\n"
+            )
+            return
+
+        original = self._keyboard_original_frame
+        self._keyboard_original_frame = None
+        if original is None:
+            return
+        gaps, border = original
+        gap_value = self.gap_lua(gaps)
+        if gap_value is not None:
+            hypr_eval_lua(
+                "hl.config({ general = { "
+                f"gaps_out = {gap_value}, border_size = {border} "
+                "} })\n"
+            )
+
+    def fit_fullscreen_above_keyboard(self, visible: bool) -> None:
+        """Fit a fullscreen client into the keyboard's remaining work area."""
+        clients = hyprctl_json("clients")
+        if not isinstance(clients, list):
+            return
+        by_address = {
+            client.get("address"): client
+            for client in clients
+            if isinstance(client, dict) and isinstance(client.get("address"), str)
+        }
+
+        if visible:
+            active = hyprctl_json("activewindow")
+            if not isinstance(active, dict) or active.get("fullscreen") != 2:
+                return
+            address = active.get("address")
+            if not isinstance(address, str) or address in self._keyboard_fit_windows:
+                return
+            client_mode = int(active.get("fullscreenClient", 2))
+            if self.set_fullscreen_state(address, 1, client_mode):
+                self._keyboard_fit_windows[address] = client_mode
+                self.set_keyboard_frame(True)
+            return
+
+        for address, client_mode in list(self._keyboard_fit_windows.items()):
+            current = by_address.get(address)
+            # A user or the application may have left fullscreen while the
+            # keyboard was open. That choice wins; only restore our own state.
+            if (
+                current
+                and current.get("fullscreen") == 1
+                and current.get("fullscreenClient") == client_mode
+            ):
+                self.set_fullscreen_state(address, 2, client_mode)
+            self._keyboard_fit_windows.pop(address, None)
+        self.set_keyboard_frame(False)
+
+    def toggle_fullscreen(self) -> None:
+        """Toggle fullscreen while respecting the keyboard's fitted state."""
+        active = hyprctl_json("activewindow")
+        if not isinstance(active, dict):
+            return
+        address = active.get("address")
+        if not isinstance(address, str):
+            return
+
+        internal = int(active.get("fullscreen", 0))
+        if address in self._keyboard_fit_windows and internal == 1:
+            self._keyboard_fit_windows.pop(address, None)
+            self.set_fullscreen_state(address, 0, 0)
+            self.set_keyboard_frame(False)
+        elif internal == 2:
+            self._keyboard_fit_windows.pop(address, None)
+            self.set_fullscreen_state(address, 0, 0)
+            self.set_keyboard_frame(False)
+        elif self.tablet_mode and self.osk.visible:
+            if self.set_fullscreen_state(address, 1, 2):
+                self._keyboard_fit_windows[address] = 2
+                self.set_keyboard_frame(True)
+        else:
+            self.set_fullscreen_state(address, 2, 2)
+
+    def publish_osk(self, visible: bool, inset: int) -> None:
+        """Hand the shell the keyboard's footprint."""
+        self.fit_fullscreen_above_keyboard(visible)
+        try:
+            tmp = OSK_STATE_PATH.with_suffix(".tmp")
+            with tmp.open("w") as fh:
+                json.dump({"visible": visible, "inset": inset}, fh)
+                fh.write("\n")
+            tmp.replace(OSK_STATE_PATH)
+        except OSError as exc:
+            log(f"could not publish keyboard state: {exc}")
+
+    def sync_handle(self) -> None:
+        """Put the grab strip wherever the keyboard currently isn't.
+
+        Folded with the keyboard down, it sits on the bottom edge and pulls the
+        keyboard up. Folded with the keyboard up, it moves to sit on top of
+        wvkbd and pushes it back down -- so the handle is always the answer,
+        whichever way round the keyboard is. In laptop mode there is a real
+        keyboard, so it goes away entirely.
+        """
+        if not self.tablet_mode:
+            self.grab.stop()
+            self.publish_osk(False, 0)
+            return
+        mon = pick_monitor(self.cfg)
+        name = mon.get("name") if mon else None
+        if self.osk.visible:
+            # Publish the remembered size first, so the shell starts getting out
+            # of the way as the keyboard rises rather than once it has landed,
+            # then correct it from the measurement. Any difference lands inside
+            # the shell's own 500ms easing and is never seen.
+            remembered = self._osk_offsets.get(self.transform % 2)
+            if remembered:
+                self.publish_osk(True, remembered)
+            offset = self.osk_offset(mon)
+            self._osk_offsets[self.transform % 2] = offset
+            self.publish_osk(True, offset)
+            self.grab.start(name, mode="close", bottom=offset)
+        else:
+            self.publish_osk(False, 0)
+            self.grab.start(name, mode="open", bottom=0)
+
+    def set_tablet_mode(self, on: bool) -> dict:
+        with self.lock:
+            unchanged = on == self.tablet_mode
+            if on and unchanged:
+                return {"ok": True, "tablet_mode": on, "note": "unchanged"}
+            self.tablet_mode = on
+            if not unchanged:
+                log(f"tablet mode {'on' if on else 'off'}")
+            if on:
+                self.set_pointers_enabled(False)
+                if self.cfg.get("osk_preload_in_tablet", True):
+                    # Hidden, so it costs a process but shows nothing until
+                    # the bottom-edge swipe (or Super+O) asks for it.
+                    err = self.osk.start()
+                    if err:
+                        log(err)
+                notify(
+                    self.cfg,
+                    "Tablet mode",
+                    "Pull the handle at the bottom left up for the keyboard, "
+                    "push it back down to dismiss",
+                    "tablet_android",
+                )
+            else:
+                # Unconditional, and forced: this is the path that undoes
+                # anything tablet mode turned off, and it is the only thing
+                # standing between a missed un-fold and a dead keyboard.
+                self.set_pointers_enabled(True, force=True)
+                self.osk.stop()
+                if not unchanged:
+                    # Folding back into a laptop always means upright.
+                    if not self.rotation_locked and self.transform != NORMAL:
+                        self.orientation = "normal"
+                        self.apply_transform(NORMAL, reason="laptop mode")
+                    notify(
+                        self.cfg,
+                        "Laptop mode",
+                        "Keyboard and touchpad restored",
+                        "laptop_chromebook",
+                    )
+            self.sync_handle()
+            return {"ok": True, "tablet_mode": on}
+
+    def handle(self, req: dict) -> dict:
+        cmd = req.get("cmd")
+        arg = req.get("arg")
+
+        if cmd == "status":
+            with self.lock:
+                return {
+                    "ok": True,
+                    "tablet_mode": self.tablet_mode,
+                    "rotation_locked": self.rotation_locked,
+                    "auto_rotate": self.cfg.get("auto_rotate"),
+                    "orientation": self.orientation,
+                    "transform": self.transform,
+                    "degrees": self.transform * 90,
+                    "osk_running": self.osk._alive(),
+                    "osk_visible": self.osk.visible,
+                    "osk_available": self.osk.available(),
+                    "handle_running": self.grab._alive(),
+                    "handle_state": self.grab.state,
+                    "accelerometer": str(self.accel.base) if self.accel.base else None,
+                    "invert_sides": bool(self.cfg.get("invert_sides")),
+                }
+
+        if cmd == "fullscreen":
+            with self.lock:
+                self.toggle_fullscreen()
+                return {"ok": True}
+
+        if cmd == "mode":
+            if arg not in ("tablet", "laptop"):
+                return {"ok": False, "error": "mode takes 'tablet' or 'laptop'"}
+            return self.set_tablet_mode(arg == "tablet")
+
+        if cmd == "rotate":
+            with self.lock:
+                if arg == "auto":
+                    self.rotation_locked = False
+                    target = ORIENTATION_TRANSFORM[self.orientation]
+                elif arg == "next":
+                    self.rotation_locked = True
+                    target = (self.transform + 1) % 4
+                else:
+                    try:
+                        target = int(arg) % 4
+                    except (TypeError, ValueError):
+                        return {"ok": False, "error": "rotate takes 0|1|2|3|next|auto"}
+                    # An explicit angle is a manual choice; hold it.
+                    self.rotation_locked = True
+                err = self.apply_transform(target, reason="manual")
+                if err:
+                    return {"ok": False, "error": err}
+                return {
+                    "ok": True,
+                    "transform": self.transform,
+                    "degrees": self.transform * 90,
+                    "rotation_locked": self.rotation_locked,
+                }
+
+        if cmd in ("lock", "unlock", "toggle-lock"):
+            with self.lock:
+                if cmd == "lock":
+                    self.rotation_locked = True
+                elif cmd == "unlock":
+                    self.rotation_locked = False
+                else:
+                    self.rotation_locked = not self.rotation_locked
+                state = "locked" if self.rotation_locked else "unlocked"
+                notify(
+                    self.cfg,
+                    f"Rotation {state}",
+                    "",
+                    "screen_lock_rotation" if self.rotation_locked else "screen_rotation",
+                )
+                if not self.rotation_locked and self.rotation_active():
+                    # Do not trust a value cached by the background poller:
+                    # lock toggles are expected to react immediately even if
+                    # the machine moved just before the click.
+                    self.sample_orientation()
+                    target = ORIENTATION_TRANSFORM[self.orientation]
+                    if target != self.transform:
+                        self.apply_transform(target, reason="unlocked")
+                return {"ok": True, "rotation_locked": self.rotation_locked}
+
+        if cmd == "osk":
+            with self.lock:
+                if not self.osk.available():
+                    return {
+                        "ok": False,
+                        "error": f"{self.osk.command[0]} is not installed",
+                    }
+                if arg == "show":
+                    err = self.osk.show()
+                elif arg == "hide":
+                    err = self.osk.hide()
+                elif arg in (None, "toggle"):
+                    err = self.osk.toggle()
+                elif arg == "stop":
+                    self.osk.stop()
+                    err = None
+                else:
+                    return {"ok": False, "error": "osk takes show|hide|toggle|stop"}
+                if err:
+                    return {"ok": False, "error": err}
+                self.sync_handle()
+                return {"ok": True, "osk_visible": self.osk.visible}
+
+        if cmd == "swap-sides":
+            with self.lock:
+                self.cfg["invert_sides"] = not self.cfg.get("invert_sides", False)
+                stored = load_config()
+                stored["invert_sides"] = self.cfg["invert_sides"]
+                save_config(stored)
+                # Re-evaluate immediately so the effect is visible at once.
+                g = self.accel.read_g()
+                if g and self.rotation_active():
+                    self.orientation = self.orientation_from(g)
+                    self.apply_transform(
+                        ORIENTATION_TRANSFORM[self.orientation], reason="swap-sides"
+                    )
+                notify(
+                    self.cfg,
+                    "Rotation sides swapped",
+                    f"invert_sides = {self.cfg['invert_sides']}",
+                    "screen_rotation",
+                )
+                return {"ok": True, "invert_sides": self.cfg["invert_sides"]}
+
+        if cmd == "retheme":
+            with self.lock:
+                self.cfg.update(load_config())
+                self.osk.cfg = self.cfg
+                self.grab.cfg = self.cfg
+                # The handle reads its colours from the environment at spawn,
+                # so a new scheme only reaches it across a restart.
+                self.grab.stop()
+                self.sync_handle()
+                if not self.osk._alive():
+                    # Nothing on screen; the next spawn picks the colours up.
+                    return {"ok": True, "note": "keyboard not running"}
+                self.osk.reflow()
+                return {"ok": True, "note": "keyboard recoloured"}
+
+        if cmd == "reload":
+            with self.lock:
+                self.cfg.update(load_config())
+                self.osk.cfg = self.cfg
+                self.osk._flags = None
+                self.grab.cfg = self.cfg
+                self.grab.stop()
+                self.sync_handle()
+                return {"ok": True}
+
+        if cmd == "quit":
+            self.stopping.set()
+            return {"ok": True}
+
+        return {"ok": False, "error": f"unknown command {cmd!r}"}
+
+    # -- serving ------------------------------------------------------------
+
+    def serve(self) -> None:
+        if SOCKET_PATH.exists():
+            # A stale socket from an unclean exit would otherwise block bind().
+            try:
+                probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                probe.settimeout(0.5)
+                probe.connect(str(SOCKET_PATH))
+                probe.close()
+                log(f"another {APP} daemon is already running")
+                sys.exit(1)
+            except OSError:
+                SOCKET_PATH.unlink(missing_ok=True)
+
+        srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        srv.bind(str(SOCKET_PATH))
+        srv.listen(8)
+        srv.settimeout(0.5)
+
+        poller = threading.Thread(target=self.poll_loop, daemon=True)
+        poller.start()
+
+        log(f"listening on {SOCKET_PATH}")
+        try:
+            while not self.stopping.is_set():
+                try:
+                    conn, _ = srv.accept()
+                except socket.timeout:
+                    continue
+                except OSError:
+                    break
+                with conn:
+                    conn.settimeout(2)
+                    try:
+                        data = conn.recv(65536)
+                        req = json.loads(data.decode() or "{}")
+                        reply = self.handle(req)
+                    except (OSError, ValueError) as exc:
+                        reply = {"ok": False, "error": str(exc)}
+                    try:
+                        conn.sendall(json.dumps(reply).encode())
+                    except OSError:
+                        pass
+        finally:
+            # Whatever happened, hand the hardware back.
+            self.set_pointers_enabled(True, force=True)
+            self.osk.stop()
+            self.grab.stop()
+            self.publish_osk(False, 0)
+            srv.close()
+            SOCKET_PATH.unlink(missing_ok=True)
+            log("stopped")
+
+
+def send(req: dict, timeout: float = 5.0) -> dict:
+    try:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(timeout)
+        sock.connect(str(SOCKET_PATH))
+    except OSError:
+        return {
+            "ok": False,
+            "error": f"{APP} daemon is not running "
+            f"(start it with: systemctl --user start {APP})",
+        }
+    with sock:
+        sock.sendall(json.dumps(req).encode())
+        try:
+            data = sock.recv(65536)
+        except OSError as exc:
+            return {"ok": False, "error": str(exc)}
+    try:
+        return json.loads(data.decode())
+    except ValueError:
+        return {"ok": False, "error": "malformed reply from daemon"}
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        prog=APP,
+        description="Tablet mode and screen auto-rotation for Hyprland on a Lenovo Yoga.",
+    )
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("daemon", help="run the daemon (normally via systemd)")
+    sub.add_parser("status", help="show current state as JSON")
+    sub.add_parser("fullscreen", help="toggle fullscreen with keyboard-aware geometry")
+
+    p_mode = sub.add_parser("mode", help="tell the daemon the hinge changed")
+    p_mode.add_argument("state", choices=["tablet", "laptop"])
+
+    p_rot = sub.add_parser("rotate", help="rotate the panel")
+    p_rot.add_argument(
+        "angle",
+        nargs="?",
+        default="next",
+        help="0|1|2|3 (quarter turns), 'next', or 'auto' to resume the sensor",
+    )
+
+    sub.add_parser("lock", help="hold the current rotation")
+    sub.add_parser("unlock", help="resume sensor-driven rotation")
+    sub.add_parser("toggle-lock", help="toggle the rotation lock")
+    sub.add_parser(
+        "swap-sides", help="flip 90 and 270 if the screen turns the wrong way"
+    )
+    sub.add_parser("reload", help="re-read the config file")
+    sub.add_parser(
+        "retheme", help="recolour the keyboard from the current Caelestia scheme"
+    )
+
+    p_osk = sub.add_parser("osk", help="control the on-screen keyboard")
+    p_osk.add_argument(
+        "action", nargs="?", default="toggle", choices=["show", "hide", "toggle", "stop"]
+    )
+
+    args = parser.parse_args()
+
+    if args.cmd == "daemon":
+        cfg = load_config()
+        daemon = Daemon(cfg)
+
+        def shutdown(_signum, _frame):
+            daemon.stopping.set()
+
+        signal.signal(signal.SIGTERM, shutdown)
+        signal.signal(signal.SIGINT, shutdown)
+        daemon.serve()
+        return 0
+
+    if args.cmd == "mode":
+        reply = send({"cmd": "mode", "arg": args.state})
+    elif args.cmd == "rotate":
+        reply = send({"cmd": "rotate", "arg": args.angle})
+    elif args.cmd == "osk":
+        reply = send({"cmd": "osk", "arg": args.action})
+    else:
+        reply = send({"cmd": args.cmd})
+
+    if args.cmd == "status":
+        print(json.dumps(reply, indent=2))
+    elif not reply.get("ok"):
+        print(f"{APP}: {reply.get('error', 'failed')}", file=sys.stderr)
+    return 0 if reply.get("ok") else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
