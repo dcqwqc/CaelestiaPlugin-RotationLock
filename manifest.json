@@ -2,6 +2,7 @@
   "name": "RotationLock",
   "version": "0.1.0",
   "author": "dcqwqc",
+  "homepage": "https://github.com/dcqwqc/caelestia-plugin-rotation-lock",
   "icon": "screen_rotation",
   "description": "Rotation lock for a convertible, as owned by the yoga-tablet daemon. Hides itself where the daemon is not running.",
   "entryPoints": [
