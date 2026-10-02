@@ -23,6 +23,7 @@ Singleton {
     property bool available: false
     property bool locked: false
     property bool tabletMode: false
+    property bool tabletModeChanging: false
 
     function refresh(): void {
         if (!status.running)
@@ -32,6 +33,14 @@ Singleton {
     function toggle(): void {
         if (!toggler.running)
             toggler.running = true;
+    }
+
+    function toggleTabletMode(): void {
+        if (tabletModeChanging)
+            return;
+        tabletModeChanging = true;
+        tabletToggler.command = [root.bin, "mode", root.tabletMode ? "laptop" : "tablet"];
+        tabletToggler.running = true;
     }
 
     // `status` is the only subcommand that answers on stdout; the rest report
@@ -71,6 +80,19 @@ Singleton {
 
         command: [root.bin, "toggle-lock"]
         onExited: code => {
+            if (code === 0)
+                root.refresh();
+            else
+                root.available = false;
+        }
+    }
+
+    Process {
+        id: tabletToggler
+
+        running: false
+        onExited: code => {
+            root.tabletModeChanging = false;
             if (code === 0)
                 root.refresh();
             else
