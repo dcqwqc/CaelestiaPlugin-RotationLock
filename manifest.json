@@ -1,10 +1,10 @@
 {
   "name": "RotationLock",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "author": "dcqwqc",
-  "homepage": "https://github.com/dcqwqc/CaelestiaPlugin-RotationLock",
-  "icon": "screen_rotation",
-  "description": "Convertible laptop support: auto-rotation, tablet mode, on-screen keyboard and rotation lock, fully owned by this plugin.",
+  "homepage": "https://github.com/dcqwqc/CaelestiaPlugin-TabletMode",
+  "icon": "tablet_android",
+  "description": "Convertible laptop support for Caelestia: hinge tablet mode, sensor auto-rotation, on-screen keyboard and rotation lock.",
   "entryPoints": [
     {
       "type": "custom",
@@ -17,5 +17,6 @@
         "name": "rotationLock"
       }
     }
-  ]
+  ],
+  "settings": "Settings.qml"
 }

@@ -2,9 +2,9 @@ import QtQuick
 import Quickshell
 import Quickshell.Io
 
-// The plugin owns the convertible daemon now. If an old systemd-managed daemon
-// is already present this process exits immediately and RotationLock continues
-// talking to that socket; on a clean install this is the daemon owner.
+// TabletMode is the sole owner of the convertible runtime. The small
+// ~/.local/bin/yoga-tablet compatibility entry is only a symlink back here so
+// Hyprland keybinds and terminal commands never carry a second copy.
 Item {
     id: root
 
@@ -12,10 +12,54 @@ Item {
     height: 0
     visible: false
 
-    readonly property string bin: `${Quickshell.env("HOME")}/.local/share/caelestia/plugins/rotation-lock/scripts/yoga-tablet`
+    readonly property string home: Quickshell.env("HOME")
+    readonly property string bin: `${root.home}/.local/share/caelestia/plugins/tablet-mode/scripts/yoga-tablet`
 
     Process {
+        id: daemon
         command: [root.bin, "daemon"]
         running: true
+    }
+
+    Process {
+        id: reloadProc
+        command: [root.bin, "reload"]
+    }
+
+    Process {
+        id: rethemeProc
+        command: [root.bin, "retheme"]
+    }
+
+    Timer {
+        id: reloadDebounce
+        interval: 180
+        repeat: false
+        onTriggered: if (!reloadProc.running)
+            reloadProc.running = true
+    }
+
+    // SettingsObject persists into plugins.json. Re-read it live instead of
+    // requiring a shell restart for every slider/toggle change.
+    FileView {
+        path: `${root.home}/.config/caelestia/plugins.json`
+        watchChanges: true
+        printErrors: false
+        onFileChanged: {
+            reload();
+            reloadDebounce.restart();
+        }
+    }
+
+    // This replaces the old yoga-tablet-theme.path systemd unit.
+    FileView {
+        path: `${root.home}/.local/state/caelestia/scheme.json`
+        watchChanges: true
+        printErrors: false
+        onFileChanged: {
+            reload();
+            if (!rethemeProc.running)
+                rethemeProc.running = true;
+        }
     }
 }

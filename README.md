@@ -1,41 +1,53 @@
-# RotationLock
+# Caelestia Tablet Mode
 
-Rotation lock for a convertible, as a Caelestia quick toggle.
+Convertible-laptop support for Caelestia/Hyprland, packaged as one plugin.
 
-The `yoga-tablet` daemon owns the lock, and other things flip it — a keybind,
-folding the hinge — so this never caches a guess. It re-reads the daemon's state
-whenever the toggle comes back on screen, and again after every write.
+It owns the complete Yoga tablet runtime:
 
-Where the daemon is not installed or not answering, the toggle hides itself
-rather than sitting there dead. Nothing to configure.
+- hinge-driven laptop/tablet mode
+- accelerometer auto-rotation for the panel, touchscreen and pen
+- rotation lock quick toggle
+- on-screen keyboard and swipe handle
+- live Caelestia keyboard theming
+- plugin settings in **Nexus → Plugins → RotationLock (Tablet Mode)**
 
-## Requires
-
-The `yoga-tablet` daemon from [kagami](https://github.com/dcqwqc/kagami).
-
-## Status
-
-Caelestia's plugin loader is not released yet — it lives on upstream's unmerged
-`feat/plugins` branch, and the Plugins page there is a mockup rendering four
-fake cards. So this needs a shell that carries the loader:
-
-- **On upstream Caelestia**, wait for that branch to merge.
-- **On a fork that has cherry-picked it** (`plugin/src/Caelestia/Plugins`, plus a
-  Plugins page and the quick-toggle / bar-entry hooks), it loads and is managed
-  from Nexus → Plugins today.
-
-The manifest and entry points are built against that branch's own parser rather
-than a guess at it, so the shape is the real one.
+The daemon source, OSK shell and Caelestia integration all live in this
+repository. `~/.local/bin/yoga-tablet` may exist as a compatibility symlink for
+Hyprland keybinds and CLI use; it is not a second copy of the daemon.
 
 ## Install
 
-Clone into Caelestia's plugin directory:
+Install from Caelestia's plugin manager with:
 
-    git clone https://github.com/dcqwqc/CaelestiaPlugin-RotationLock ~/.local/share/caelestia/plugins/rotation-lock
+`https://github.com/dcqwqc/CaelestiaPlugin-TabletMode`
 
-Or clone anywhere and add the parent to `path` in
-`~/.config/caelestia/plugins.json`.
+or clone it as:
+
+```sh
+git clone https://github.com/dcqwqc/CaelestiaPlugin-TabletMode \
+  ~/.local/share/caelestia/plugins/tablet-mode
+```
+
+Enable `dcqwqc/rotationlock` in the Plugins page.
+
+## Settings
+
+The plugin stores user-facing configuration in
+`~/.config/caelestia/plugins.json` under `dcqwqc/rotationlock`. The daemon reads
+those values directly and reloads them live.
+
+The old `~/.config/yoga-tablet/config.json` format is read only as a migration
+fallback and is no longer written.
+
+## CLI
+
+```sh
+yoga-tablet status
+yoga-tablet toggle-lock
+yoga-tablet rotate next
+yoga-tablet osk toggle
+```
 
 ## Licence
 
-GPL-3.0-or-later, matching Caelestia.
+GPL-3.0-or-later.

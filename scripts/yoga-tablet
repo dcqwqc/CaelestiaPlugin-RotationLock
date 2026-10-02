@@ -38,12 +38,31 @@ from pathlib import Path
 APP = "yoga-tablet"
 
 CONFIG_PATH = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / APP / "config.json"
+PLUGIN_SETTINGS_PATH = (
+    Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+    / "caelestia"
+    / "plugins.json"
+)
+PLUGIN_ID = "dcqwqc/rotationlock"
+LEGACY_PLUGIN_ID = "dcqwqc/tabletmode"
+PLUGIN_SETTING_MAP = {
+    "autoRotate": "auto_rotate",
+    "invertSides": "invert_sides",
+    "thresholdG": "threshold_g",
+    "stableSamples": "stable_samples",
+    "oskHandle": "osk_handle",
+    "oskPreload": "osk_preload_in_tablet",
+    "oskTheme": "osk_theme",
+    "disablePointersInTablet": "disable_pointers_in_tablet",
+    "notify": "notify",
+}
 RUNTIME_DIR = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"))
 SOCKET_PATH = RUNTIME_DIR / f"{APP}.sock"
 # Read by Caelestia's Osk service. Its drawer window spans the whole screen and
 # ignores exclusive zones, so it cannot see the keyboard the way ordinary
 # windows do and needs to be handed the number.
 OSK_STATE_PATH = RUNTIME_DIR / f"{APP}-osk.json"
+CAPTURE_TRANSFORM_PATH = RUNTIME_DIR / f"{APP}-capture-transform"
 IIO_ROOT = Path("/sys/bus/iio/devices")
 # Caelestia rewrites this whenever the colour scheme or light/dark mode changes.
 SCHEME_PATH = (
@@ -191,12 +210,87 @@ DEFAULTS = {
 }
 
 
+def write_capture_transform(transform: int) -> None:
+    """Publish the authoritative panel transform for screen-capture consumers."""
+    try:
+        tmp = CAPTURE_TRANSFORM_PATH.with_suffix(".tmp")
+        tmp.write_text(f"{int(transform) % 4}\n")
+        tmp.replace(CAPTURE_TRANSFORM_PATH)
+    except OSError as exc:
+        log(f"cannot publish capture transform: {exc}")
+
+
 def log(msg: str) -> None:
     print(f"[{APP}] {msg}", flush=True)
 
 
+def load_plugin_config() -> dict:
+    """Read user-facing TabletMode settings from Caelestia's plugin store."""
+    try:
+        with PLUGIN_SETTINGS_PATH.open() as fh:
+            data = json.load(fh)
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError) as exc:
+        log(f"ignoring unreadable plugin settings {PLUGIN_SETTINGS_PATH}: {exc}")
+        return {}
+
+    all_settings = data.get("settings", {})
+    if not isinstance(all_settings, dict):
+        return {}
+    raw = all_settings.get(PLUGIN_ID)
+    if not isinstance(raw, dict):
+        raw = all_settings.get(LEGACY_PLUGIN_ID, {})
+    if not isinstance(raw, dict):
+        return {}
+
+    mapped = {}
+    for public_name, daemon_name in PLUGIN_SETTING_MAP.items():
+        if public_name in raw:
+            mapped[daemon_name] = raw[public_name]
+    return mapped
+
+
+def save_plugin_setting(name: str, value) -> None:
+    """Persist one user-facing setting without creating a second config source."""
+    try:
+        with PLUGIN_SETTINGS_PATH.open() as fh:
+            data = json.load(fh)
+        if not isinstance(data, dict):
+            data = {}
+    except FileNotFoundError:
+        data = {}
+    except (OSError, ValueError) as exc:
+        log(f"cannot update plugin settings {PLUGIN_SETTINGS_PATH}: {exc}")
+        return
+
+    settings = data.setdefault("settings", {})
+    if not isinstance(settings, dict):
+        settings = data["settings"] = {}
+    values = settings.setdefault(PLUGIN_ID, {})
+    if not isinstance(values, dict):
+        values = settings[PLUGIN_ID] = {}
+    values[name] = value
+
+    PLUGIN_SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp = PLUGIN_SETTINGS_PATH.with_suffix(".tmp")
+    try:
+        with tmp.open("w") as fh:
+            json.dump(data, fh, indent=4)
+            fh.write("\n")
+        tmp.replace(PLUGIN_SETTINGS_PATH)
+    except OSError as exc:
+        log(f"cannot save plugin settings {PLUGIN_SETTINGS_PATH}: {exc}")
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
 def load_config() -> dict:
     cfg = dict(DEFAULTS)
+    # Legacy standalone config is read only as a migration fallback. Plugin
+    # settings override it and are the only source written by this daemon.
     try:
         with CONFIG_PATH.open() as fh:
             user = json.load(fh)
@@ -206,16 +300,8 @@ def load_config() -> dict:
         pass
     except (OSError, ValueError) as exc:
         log(f"ignoring unreadable config {CONFIG_PATH}: {exc}")
+    cfg.update(load_plugin_config())
     return cfg
-
-
-def save_config(cfg: dict) -> None:
-    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    tmp = CONFIG_PATH.with_suffix(".tmp")
-    with tmp.open("w") as fh:
-        json.dump(cfg, fh, indent=2)
-        fh.write("\n")
-    tmp.replace(CONFIG_PATH)
 
 
 def toast(title: str, body: str, icon: str, level: str) -> bool:
@@ -762,6 +848,7 @@ class Daemon:
         self._keyboard_original_frame: tuple[str, int] | None = None
         self.rotation_locked = False
         self.transform = self._current_transform()
+        write_capture_transform(self.transform)
         # Start from the compositor's real state. Otherwise an unlock shortly
         # after daemon startup can use the synthetic "normal" value and undo a
         # valid portrait transform before the sensor loop has settled.
@@ -811,6 +898,7 @@ class Daemon:
             return "compositor rejected the rotation"
 
         self.transform = transform
+        write_capture_transform(self.transform)
         log(f"transform -> {transform * 90} deg{' (' + reason + ')' if reason else ''}")
         self.osk.reflow()
         # Portrait and landscape keyboards are different heights, so the strip
@@ -1249,9 +1337,7 @@ class Daemon:
         if cmd == "swap-sides":
             with self.lock:
                 self.cfg["invert_sides"] = not self.cfg.get("invert_sides", False)
-                stored = load_config()
-                stored["invert_sides"] = self.cfg["invert_sides"]
-                save_config(stored)
+                save_plugin_setting("invertSides", self.cfg["invert_sides"])
                 # Re-evaluate immediately so the effect is visible at once.
                 g = self.accel.read_g()
                 if g and self.rotation_active():
