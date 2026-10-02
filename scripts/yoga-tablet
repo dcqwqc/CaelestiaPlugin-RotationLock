@@ -62,6 +62,10 @@ SOCKET_PATH = RUNTIME_DIR / f"{APP}.sock"
 # ignores exclusive zones, so it cannot see the keyboard the way ordinary
 # windows do and needs to be handed the number.
 OSK_STATE_PATH = RUNTIME_DIR / f"{APP}-osk.json"
+# Child PID files let a fresh daemon clean up plugin-owned children left behind
+# by an unclean Caelestia/Quickshell restart.
+OSK_PID_PATH = RUNTIME_DIR / f"{APP}-wvkbd.pid"
+HANDLE_PID_PATH = RUNTIME_DIR / f"{APP}-handle.pid"
 CAPTURE_TRANSFORM_PATH = RUNTIME_DIR / f"{APP}-capture-transform"
 IIO_ROOT = Path("/sys/bus/iio/devices")
 # Caelestia rewrites this whenever the colour scheme or light/dark mode changes.
@@ -222,6 +226,75 @@ def write_capture_transform(transform: int) -> None:
 
 def log(msg: str) -> None:
     print(f"[{APP}] {msg}", flush=True)
+
+
+def write_child_pid(path: Path, pid: int) -> None:
+    """Atomically remember one plugin-owned child process."""
+    try:
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(f"{pid}\n")
+        tmp.replace(path)
+    except OSError as exc:
+        log(f"cannot write child pid {path}: {exc}")
+
+
+def clear_child_pid(path: Path, pid: int | None = None) -> None:
+    """Remove a PID file without erasing a newer child's ownership record."""
+    try:
+        if pid is not None and path.exists():
+            current = int(path.read_text().strip())
+            if current != pid:
+                return
+        path.unlink(missing_ok=True)
+    except (OSError, ValueError):
+        pass
+
+
+def cleanup_stale_child(path: Path, expected: str) -> None:
+    """Terminate a plugin child left behind by an unclean previous daemon exit."""
+    try:
+        pid = int(path.read_text().strip())
+    except (OSError, ValueError):
+        path.unlink(missing_ok=True)
+        return
+
+    if pid <= 1 or pid == os.getpid():
+        clear_child_pid(path)
+        return
+
+    try:
+        raw = (Path("/proc") / str(pid) / "cmdline").read_bytes()
+        cmdline = raw.replace(b"\0", b" ").decode(errors="replace")
+    except OSError:
+        clear_child_pid(path)
+        return
+
+    # Validate ownership before signalling in case Linux reused the PID.
+    if expected not in cmdline:
+        clear_child_pid(path)
+        return
+
+    log(f"cleaning stale child {pid}: {expected}")
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        clear_child_pid(path)
+        return
+    except OSError as exc:
+        log(f"cannot terminate stale child {pid}: {exc}")
+        return
+
+    for _ in range(10):
+        if not (Path("/proc") / str(pid)).exists():
+            break
+        time.sleep(0.05)
+    else:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+
+    clear_child_pid(path, pid)
 
 
 def load_plugin_config() -> dict:
@@ -593,6 +666,7 @@ class Osk:
         try:
             self.proc.wait(timeout=0.4)
         except subprocess.TimeoutExpired:
+            write_child_pid(OSK_PID_PATH, self.proc.pid)
             return None
         err = ""
         if self.proc.stderr is not None:
@@ -601,6 +675,7 @@ class Osk:
             except OSError:
                 pass
         rc = self.proc.returncode
+        clear_child_pid(OSK_PID_PATH, self.proc.pid)
         self.proc = None
         return f"{cmd[0]} exited immediately (status {rc}): {err or 'no output'}"
 
@@ -610,6 +685,7 @@ class Osk:
         return self._spawn(hidden=True)
 
     def stop(self) -> None:
+        pid = self.proc.pid if self.proc is not None else None
         if self._alive():
             assert self.proc is not None
             self.proc.terminate()
@@ -617,6 +693,7 @@ class Osk:
                 self.proc.wait(timeout=3)
             except subprocess.TimeoutExpired:
                 self.proc.kill()
+        clear_child_pid(OSK_PID_PATH, pid)
         self.proc = None
         self.visible = False
 
@@ -758,12 +835,14 @@ class Handle:
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
+            write_child_pid(HANDLE_PID_PATH, self.proc.pid)
             self.state = (mode, bottom)
         except OSError as exc:
             log(f"could not start the keyboard handle: {exc}")
             self.proc = None
 
     def stop(self) -> None:
+        pid = self.proc.pid if self.proc is not None else None
         if self._alive():
             assert self.proc is not None
             self.proc.terminate()
@@ -771,6 +850,7 @@ class Handle:
                 self.proc.wait(timeout=3)
             except subprocess.TimeoutExpired:
                 self.proc.kill()
+        clear_child_pid(HANDLE_PID_PATH, pid)
         self.proc = None
         self.state = None
 
@@ -1398,6 +1478,11 @@ class Daemon:
                 sys.exit(1)
             except OSError:
                 SOCKET_PATH.unlink(missing_ok=True)
+
+        # At this point no live daemon owns the socket. Clean any children
+        # recorded by the previous owner before taking over.
+        cleanup_stale_child(OSK_PID_PATH, "wvkbd-mobintl")
+        cleanup_stale_child(HANDLE_PID_PATH, str(Handle.CONFIG_DIR))
 
         srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         srv.bind(str(SOCKET_PATH))
