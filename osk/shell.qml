@@ -42,9 +42,9 @@ ShellRoot {
     // "open" sits on the screen edge and pulls the keyboard up; "close" sits on
     // top of the keyboard and pushes it back down.
     readonly property bool closing: envStr("YOGA_HANDLE_MODE", "open") === "close"
-    // In close mode this is the keyboard's height. The window subtracts its
-    // own height so the strip occupies the keyboard's top edge rather than
-    // hovering above it.
+    // In close mode this is the keyboard's height. Keep the handle window
+    // immediately ABOVE wvkbd instead of inside its surface: wvkbd may be on
+    // the same overlay layer and can otherwise paint over the close handle.
     readonly property real bottomMargin: envNum("YOGA_HANDLE_BOTTOM", 0)
 
     // Clears Caelestia's left bar, which reserves 60px, so the strip never
@@ -79,7 +79,7 @@ ShellRoot {
         anchors.left: true
         anchors.bottom: true
         margins.left: root.leftMargin
-        margins.bottom: root.closing ? Math.max(0, root.bottomMargin - root.barHeight) : root.bottomMargin
+        margins.bottom: root.bottomMargin
 
         implicitWidth: root.barWidth
         implicitHeight: root.barHeight
@@ -108,12 +108,11 @@ ShellRoot {
             id: grab
 
             anchors.horizontalCenter: parent.horizontalCenter
-            // Inside the keyboard's top edge in close mode, and inside the
-            // screen's bottom edge in open mode.
-            anchors.bottom: root.closing ? undefined : parent.bottom
-            anchors.top: root.closing ? parent.top : undefined
+            // In close mode the whole window sits just above the keyboard, so
+            // keep the grabber along its bottom edge. In open mode it stays on
+            // the screen's bottom edge as before.
+            anchors.bottom: parent.bottom
             anchors.bottomMargin: 7
-            anchors.topMargin: 7
 
             width: area.pressed ? parent.width * 0.7 : parent.width * 0.55
             height: area.pressed ? 6 : 5
