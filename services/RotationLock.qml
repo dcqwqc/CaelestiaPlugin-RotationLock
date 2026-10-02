@@ -3,6 +3,7 @@ pragma Singleton
 import QtQuick
 import Quickshell
 import Quickshell.Io
+import qs.utils
 
 // Rotation lock, as owned by the yoga-tablet daemon.
 //
@@ -13,11 +14,9 @@ import Quickshell.Io
 Singleton {
     id: root
 
-    // The shell is started by the systemd user manager, whose PATH does not
-    // carry ~/.local/bin, so `yoga-tablet` cannot be resolved by name from
-    // here -- exec'ing it by name fails with ENOENT at login and silently
-    // hides the toggle. Same reason RemoteStatus spells kagami-remote out.
-    readonly property string bin: `${Quickshell.env("HOME")}/.local/share/caelestia/plugins/rotation-lock/scripts/yoga-tablet`
+    // Rotation Lock now lives inside TabletMode. Resolve the daemon relative
+    // to this plugin so the toggle survives any Nexus clone directory name.
+    readonly property string bin: Paths.toLocalFile(Qt.resolvedUrl("../scripts/yoga-tablet"))
 
     // False until a reply actually lands, so the toggle stays hidden on a
     // machine where the daemon is not installed or not running.

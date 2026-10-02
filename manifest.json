@@ -1,10 +1,10 @@
 {
   "name": "TabletMode",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "author": "dcqwqc",
   "homepage": "https://github.com/dcqwqc/CaelestiaPlugin-TabletMode",
   "icon": "tablet_android",
-  "description": "Convertible laptop support for Caelestia: hinge tablet mode, sensor auto-rotation, on-screen keyboard and rotation lock.",
+  "description": "Convertible laptop support for Caelestia: tablet mode, sensor auto-rotation, on-screen keyboard, and integrated Rotation Lock.",
   "entryPoints": [
     {
       "type": "custom",
