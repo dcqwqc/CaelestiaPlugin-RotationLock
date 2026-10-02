@@ -1,7 +1,7 @@
 import QtQuick
 import qs.components.controls
 import qs.services
-import dcqwqc.rotationlock.services as RotationLockPlugin
+import dcqwqc.tabletmode.services as RotationLockPlugin
 
 // The daemon owns the lock and other things flip it (Super+Alt+O, folding the
 // hinge), so this re-reads whenever it comes back on screen rather than polling

@@ -25,15 +25,15 @@ or clone it as:
 
 ```sh
 git clone https://github.com/dcqwqc/CaelestiaPlugin-TabletMode \
-  ~/.local/share/caelestia/plugins/tablet-mode
+  ~/.local/share/caelestia/plugins/CaelestiaPlugin-TabletMode
 ```
 
-Enable `dcqwqc/rotationlock` in the Plugins page.
+Enable `dcqwqc/tabletmode` in the Plugins page.
 
 ## Settings
 
 The plugin stores user-facing configuration in
-`~/.config/caelestia/plugins.json` under `dcqwqc/rotationlock`. The daemon reads
+`~/.config/caelestia/plugins.json` under `dcqwqc/tabletmode`. The daemon reads
 those values directly and reloads them live.
 
 The old `~/.config/yoga-tablet/config.json` format is read only as a migration

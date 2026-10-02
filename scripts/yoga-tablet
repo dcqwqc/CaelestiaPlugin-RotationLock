@@ -43,8 +43,8 @@ PLUGIN_SETTINGS_PATH = (
     / "caelestia"
     / "plugins.json"
 )
-PLUGIN_ID = "dcqwqc/rotationlock"
-LEGACY_PLUGIN_ID = "dcqwqc/tabletmode"
+PLUGIN_ID = "dcqwqc/tabletmode"
+LEGACY_PLUGIN_ID = "dcqwqc/rotationlock"
 PLUGIN_SETTING_MAP = {
     "autoRotate": "auto_rotate",
     "invertSides": "invert_sides",

@@ -1,6 +1,7 @@
 import QtQuick
 import Quickshell
 import Quickshell.Io
+import qs.utils
 
 // TabletMode is the sole owner of the convertible runtime. The small
 // ~/.local/bin/yoga-tablet compatibility entry is only a symlink back here so
@@ -13,7 +14,9 @@ Item {
     visible: false
 
     readonly property string home: Quickshell.env("HOME")
-    readonly property string bin: `${root.home}/.local/share/caelestia/plugins/tablet-mode/scripts/yoga-tablet`
+    // Resolve relative to this plugin rather than assuming a clone directory.
+    // This keeps installs from Nexus, git clone, or a custom plugin path identical.
+    readonly property string bin: Paths.toLocalFile(Qt.resolvedUrl("scripts/yoga-tablet"))
 
     Process {
         id: daemon
