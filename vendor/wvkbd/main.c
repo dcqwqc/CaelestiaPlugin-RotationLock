@@ -612,21 +612,16 @@ layer_surface_configure(void *data, struct zwlr_layer_surface_v1 *surface,
         return;
     };
 
-    // During a clipped horizontal page transition the compositor correctly
-    // configures a narrower surface. Keep the full keyboard layout/buffer and
-    // merely acknowledge that temporary width instead of rebuilding wvkbd.
-    if (keyboard.h != h ||
-        (keyboard.w != w &&
-         !(horizontal_offset < 0 && w > 0 && w < keyboard.w))) {
+    // Not what we expected, or redimension, refresh and restart
+    if (keyboard.w != w || keyboard.h != h) {
         zwlr_layer_surface_v1_ack_configure(surface, serial);
         hide();
         show();
         return;
     };
 
-    // Reconfiguration after margin/viewport changes still needs an ack.
+    // Swallow useless events
     if (layer_surface_configured) {
-        zwlr_layer_surface_v1_ack_configure(surface, serial);
         return;
     };
     layer_surface_configured = true;
@@ -763,7 +758,7 @@ list_capabilities(void)
     puts("control-fd");
     puts("horizontal-offset");
     puts("vertical-offset");
-    puts("shell-clip");
+    puts("buffer-slide-clip");
     puts("primary-touch");
     puts("long-press-alternates");
     puts("layer-signals");
@@ -866,10 +861,8 @@ show()
     zwlr_layer_surface_v1_set_size(layer_surface, 0, height);
     zwlr_layer_surface_v1_set_anchor(layer_surface, anchor);
     zwlr_layer_surface_v1_set_margin(
-        layer_surface, 0,
-        -shell_clip_inset - horizontal_offset,
-        vertical_offset,
-        shell_clip_inset + horizontal_offset);
+        layer_surface, 0, -shell_clip_inset,
+        vertical_offset, shell_clip_inset);
     if (keyboard.exclusive) {
         zwlr_layer_surface_v1_set_exclusive_zone(layer_surface, height);
     }
@@ -891,56 +884,37 @@ toggle_visibility()
 static void
 set_surface_offset(int32_t x, int32_t y)
 {
+    int32_t previous_x = horizontal_offset;
     horizontal_offset = x;
     vertical_offset = y;
     if (!layer_surface)
         return;
 
-    /* For leftward page transitions, keep the layer surface itself pinned to
-     * the pager's left boundary and crop the buffer through wp_viewporter.
-     * This is the native equivalent of QML Item.clip: keyboard pixels never
-     * enter the transparent QuickShell strip. */
-    if (x <= 0 && draw_surf_viewport && layer_surface_configured &&
-        keyboard.w > 1) {
-        uint32_t shift = (uint32_t)(-x);
-        if (shift >= keyboard.w)
-            shift = keyboard.w - 1;
+    /* Keep the Wayland layer surface permanently at its canonical size and
+     * position. Horizontal paging is a pure buffer animation inside that
+     * fixed surface, so Hyprland never reconfigures wvkbd to a tiny width. */
+    zwlr_layer_surface_v1_set_margin(
+        layer_surface, 0, -shell_clip_inset, y, shell_clip_inset);
 
-        double scale = keyboard.preferred_fractional_scale
-            ? keyboard.preferred_fractional_scale
-            : keyboard.scale;
-        if (scale <= 0)
-            scale = 1;
-
-        uint32_t visible_w = keyboard.w - shift;
-        wp_viewport_set_source(
-            draw_surf_viewport,
-            wl_fixed_from_double((double)shift * scale),
-            wl_fixed_from_double(0),
-            wl_fixed_from_double((double)visible_w * scale),
-            wl_fixed_from_double((double)keyboard.h * scale));
-        wp_viewport_set_destination(draw_surf_viewport, visible_w, keyboard.h);
-
-        zwlr_layer_surface_v1_set_margin(
-            layer_surface, 0,
-            -shell_clip_inset + (int32_t)shift,
-            y, shell_clip_inset);
-    } else {
-        if (draw_surf_viewport && keyboard.w > 0 && keyboard.h > 0) {
-            wp_viewport_set_source(
-                draw_surf_viewport,
-                wl_fixed_from_int(-1), wl_fixed_from_int(-1),
-                wl_fixed_from_int(-1), wl_fixed_from_int(-1));
-            wp_viewport_set_destination(
-                draw_surf_viewport, keyboard.w, keyboard.h);
+    if (x < 0) {
+        if (previous_x >= 0 || !draw_surf.slide_snapshot) {
+            /* Capture a known-complete frame once at the start of the slide. */
+            kbd_draw_layout(&keyboard);
+            drwsurf_slide_begin(&draw_surf);
         }
-        zwlr_layer_surface_v1_set_margin(
-            layer_surface, 0,
-            -shell_clip_inset - x,
-            y, shell_clip_inset + x);
+        drwsurf_slide_present(&draw_surf, x);
+    } else {
+        if (draw_surf.slide_snapshot)
+            drwsurf_slide_end(&draw_surf);
+        /* Returning to x=0 always redraws the real live keyboard, eliminating
+         * stale/blank snapshots after interrupted or queued transitions. */
+        if (previous_x != 0)
+            kbd_draw_layout(&keyboard);
     }
+
     wl_surface_commit(draw_surf.surf);
 }
+
 
 static void
 handle_control_fd(void)

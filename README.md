@@ -94,9 +94,11 @@ These are compatibility entry points to the plugin-owned runtime.
 ## Hyprland layer integration
 
 Horizontal native-keyboard paging is hard-clipped at the same left boundary as
-the QML utility pager. The patched wvkbd keeps its layer surface pinned there
-and uses wp_viewporter source cropping while the buffer moves left; keyboard
-pixels therefore never render inside the transparent QuickShell edge strip.
+the QML utility pager. The patched wvkbd keeps its Wayland layer surface at a
+constant full size and animates a Cairo snapshot inside that fixed surface.
+Pixels moving past the surface's left edge are naturally clipped, while Hyprland
+never receives a reduced keyboard width. Returning to the keyboard destroys the
+snapshot and redraws the live layout, preventing tiny or blank keyboard states.
 
 On Hyprland, keeping the wvkbd layer rule at no_anim = true, order = -10 is
 also recommended. The negative order keeps the native surface behind Caelestia's

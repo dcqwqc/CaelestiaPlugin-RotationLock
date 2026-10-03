@@ -32,11 +32,16 @@ struct drwsurf {
 
 	struct drwbuf *back_buffer;
 	struct drwbuf *display_buffer;
+	cairo_surface_t *slide_snapshot;
 };
 struct kbd;
 
 void drwsurf_resize(struct drwsurf *ds, uint32_t w, uint32_t h, double s);
 void drwsurf_attach(struct drwsurf *ds);
+void drwsurf_flip(struct drwsurf *ds);
+void drwsurf_slide_begin(struct drwsurf *ds);
+void drwsurf_slide_present(struct drwsurf *ds, int32_t logical_x);
+void drwsurf_slide_end(struct drwsurf *ds);
 
 typedef union {
 	uint8_t bgra[4];

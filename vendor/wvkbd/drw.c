@@ -71,6 +71,11 @@ drwsurf_resize(struct drwsurf *ds, uint32_t w, uint32_t h, double s)
 
     ds->released = true;
 
+    if (ds->slide_snapshot) {
+        cairo_surface_destroy(ds->slide_snapshot);
+        ds->slide_snapshot = NULL;
+    }
+
     setup_buffer(ds, ds->back_buffer);
     setup_buffer(ds, ds->display_buffer);
 }
@@ -109,6 +114,60 @@ drwsurf_attach(struct drwsurf *ds)
     wl_surface_commit(ds->surf);
     ds->released = false;
     ds->attached = true;
+}
+
+
+void
+drwsurf_slide_begin(struct drwsurf *ds)
+{
+    if (ds->slide_snapshot) {
+        cairo_surface_destroy(ds->slide_snapshot);
+        ds->slide_snapshot = NULL;
+    }
+
+    cairo_surface_flush(ds->back_buffer->cairo_surf);
+    ds->slide_snapshot = cairo_image_surface_create(
+        CAIRO_FORMAT_ARGB32, ds->width, ds->height);
+    cairo_t *cr = cairo_create(ds->slide_snapshot);
+    cairo_set_operator(cr, CAIRO_OPERATOR_SOURCE);
+    cairo_set_source_surface(cr, ds->back_buffer->cairo_surf, 0, 0);
+    cairo_paint(cr);
+    cairo_destroy(cr);
+    cairo_surface_flush(ds->slide_snapshot);
+}
+
+void
+drwsurf_slide_present(struct drwsurf *ds, int32_t logical_x)
+{
+    if (!ds->slide_snapshot)
+        return;
+
+    drwsurf_flip(ds);
+    struct drwbuf *d = ds->back_buffer;
+
+    cairo_save(d->cairo);
+    cairo_identity_matrix(d->cairo);
+    cairo_set_operator(d->cairo, CAIRO_OPERATOR_CLEAR);
+    cairo_paint(d->cairo);
+
+    cairo_set_operator(d->cairo, CAIRO_OPERATOR_SOURCE);
+    cairo_set_source_surface(
+        d->cairo, ds->slide_snapshot, logical_x * ds->scale, 0);
+    cairo_paint(d->cairo);
+    cairo_restore(d->cairo);
+
+    uint32_t logical_w = (uint32_t)ceil(ds->width / ds->scale);
+    uint32_t logical_h = (uint32_t)ceil(ds->height / ds->scale);
+    drwsurf_damage(ds, 0, 0, logical_w, logical_h);
+}
+
+void
+drwsurf_slide_end(struct drwsurf *ds)
+{
+    if (ds->slide_snapshot) {
+        cairo_surface_destroy(ds->slide_snapshot);
+        ds->slide_snapshot = NULL;
+    }
 }
 
 void
