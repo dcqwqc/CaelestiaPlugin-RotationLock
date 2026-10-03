@@ -13,6 +13,20 @@ The plugin provides:
 
 Hardware selection is not tied to a particular laptop model. The runtime discovers the internal display from common internal-panel connector types and uses Hyprland's main-keyboard and touchpad device information instead of vendor-specific input names.
 
+## Touch-friendly bar popouts
+
+Caelestia's status popouts are normally hover-driven. TabletMode adds a
+touchscreen-only tap latch for the same bar targets, and it intentionally works
+even when the convertible is in normal laptop mode. Tapping Bluetooth, network,
+audio, battery, or another bar popout opens the same panel that mouse hover
+selects and keeps it open after finger release. Mouse and touchpad hover
+semantics remain unchanged.
+
+The integration is owned by scripts/ensure-touch-popouts. It is idempotent,
+keeps timestamped shell backups under
+~/.local/state/caelestia-tabletmode/shell-backups, and fails closed if a future
+Caelestia update changes the expected interaction hooks.
+
 ## Compatibility names
 
 The historical helper executable is named `yoga-tablet`, and older installations may have state under `~/.config/yoga-tablet`. Those names are retained for compatibility only; the plugin is not restricted to Lenovo Yoga hardware.

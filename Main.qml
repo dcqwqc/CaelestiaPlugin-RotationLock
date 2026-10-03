@@ -17,6 +17,15 @@ Item {
     // Resolve relative to this plugin rather than assuming a clone directory.
     // This keeps installs from Nexus, git clone, or a custom plugin path identical.
     readonly property string bin: Paths.toLocalFile(Qt.resolvedUrl("scripts/yoga-tablet"))
+    readonly property string touchIntegrationBin: Paths.toLocalFile(Qt.resolvedUrl("scripts/ensure-touch-popouts"))
+
+    // Keep the tiny Caelestia interaction hook owned by this plugin.
+    // The helper is idempotent and refuses to guess after incompatible upstream changes.
+    Process {
+        id: touchIntegration
+        command: [root.touchIntegrationBin]
+        running: true
+    }
 
     Process {
         id: daemon

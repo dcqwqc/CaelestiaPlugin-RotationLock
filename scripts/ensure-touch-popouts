@@ -1,0 +1,193 @@
+#!/usr/bin/env python3
+"""Keep Caelestia bar popouts usable from a touchscreen."""
+
+from __future__ import annotations
+
+import os
+import shutil
+import sys
+import time
+from pathlib import Path
+
+CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+SHELL_ROOT = CONFIG_HOME / "quickshell" / "caelestia"
+DRAWERS = SHELL_ROOT / "modules" / "drawers"
+INTERACTIONS = DRAWERS / "Interactions.qml"
+CONTENT_WINDOW = DRAWERS / "ContentWindow.qml"
+STATE_HOME = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state"))
+BACKUP_ROOT = STATE_HOME / "caelestia-tabletmode" / "shell-backups"
+
+
+def replace_once(text: str, old: str, new: str, label: str) -> str:
+    if new in text:
+        return text
+    count = text.count(old)
+    if count != 1:
+        raise RuntimeError(f"{label}: expected one patch anchor, found {count}")
+    return text.replace(old, new, 1)
+
+
+def backup(path: Path) -> None:
+    BACKUP_ROOT.mkdir(parents=True, exist_ok=True)
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    shutil.copy2(path, BACKUP_ROOT / f"{path.name}.{stamp}.bak")
+
+
+def patch_interactions(text: str) -> str:
+    text = replace_once(
+        text,
+        "    property bool utilitiesShortcutActive\n",
+        "    property bool utilitiesShortcutActive\n"
+        "    // TabletMode touch-popout latch: real touchscreen taps pin hover popouts.\n"
+        "    property bool popoutTouchLatched\n",
+        "popout latch property",
+    )
+
+    anchor = """    function onWheel(event: WheelEvent): void {
+        if (fullscreen)
+            return;
+        if (event.x < bar.implicitWidth) {
+            bar.handleWheel(event.y, event.angleDelta);
+        }
+    }
+
+"""
+    helpers = anchor + """    // Caelestia's bar popouts normally live only while a pointer is hovering
+    // them; a touchscreen finger has no persistent hover.
+    function closeUnfocusedPopout(): void {
+        if (!popouts.currentName.startsWith("traymenu") || ((popouts.current as StackView)?.depth ?? 0) <= 1) {
+            popouts.hasCurrent = false;
+            bar.closeTray();
+        }
+    }
+
+    function handleTouchPopout(x: real, y: real): void {
+        if (fullscreen || popouts.isDetached)
+            return;
+
+        // Reuse the exact same hit testing and popout selection as mouse hover.
+        if (x < bar.implicitWidth) {
+            bar.checkPopout(y);
+            if (popouts.hasCurrent) {
+                popoutTouchLatched = true;
+                return;
+            }
+        }
+
+        // Touching inside the pinned popout is interaction, not dismissal.
+        if (popoutTouchLatched && inLeftPanel(panels.popoutsWrapper, x, y))
+            return;
+
+        popoutTouchLatched = false;
+        closeUnfocusedPopout();
+    }
+
+"""
+    text = replace_once(text, anchor, helpers, "touch helper functions")
+
+    text = replace_once(
+        text,
+        "    hoverEnabled: true\n\n",
+        """    hoverEnabled: true
+
+    // Handle only real touchscreen input. This intentionally stays enabled in
+    // laptop mode too: hinge state and input device type are separate concerns.
+    TapHandler {
+        acceptedDevices: PointerDevice.TouchScreen
+        target: null
+
+        onTapped: (eventPoint, button) => {
+            root.handleTouchPopout(eventPoint.position.x, eventPoint.position.y);
+        }
+    }
+
+""",
+        "touchscreen TapHandler",
+    )
+
+    old_contains = """            if (!popouts.currentName.startsWith("traymenu") || ((popouts.current as StackView)?.depth ?? 0) <= 1) {
+                popouts.hasCurrent = false;
+                bar.closeTray();
+            }
+"""
+    new_contains = """            if (!popoutTouchLatched && (!popouts.currentName.startsWith("traymenu") || ((popouts.current as StackView)?.depth ?? 0) <= 1)) {
+                popouts.hasCurrent = false;
+                bar.closeTray();
+            }
+"""
+    text = replace_once(text, old_contains, new_contains, "containsMouse dismissal guard")
+
+    old_move = """        } else if ((!popouts.currentName.startsWith("traymenu") || ((popouts.current as StackView)?.depth ?? 0) <= 1) && !inLeftPanel(panels.popoutsWrapper, x, y)) {
+            popouts.hasCurrent = false;
+            bar.closeTray();
+        }
+"""
+    new_move = """        } else if (!popoutTouchLatched && (!popouts.currentName.startsWith("traymenu") || ((popouts.current as StackView)?.depth ?? 0) <= 1) && !inLeftPanel(panels.popoutsWrapper, x, y)) {
+            popouts.hasCurrent = false;
+            bar.closeTray();
+        }
+"""
+    text = replace_once(text, old_move, new_move, "pointer move dismissal guard")
+
+    connection_anchor = """    // Monitor individual visibility changes
+    Connections {
+"""
+    connection = """    Connections {
+        function onHasCurrentChanged(): void {
+            if (!popouts.hasCurrent)
+                root.popoutTouchLatched = false;
+        }
+
+        target: popouts
+    }
+
+    // Monitor individual visibility changes
+    Connections {
+"""
+    text = replace_once(text, connection_anchor, connection, "popout state reset")
+    return text
+
+
+def patch_content_window(text: str) -> str:
+    old = "        active: !root.workspaceFocusRearm && (("
+    new = "        active: !root.workspaceFocusRearm && ((interactions.popoutTouchLatched && panels.popouts.hasCurrent) || ("
+    return replace_once(text, old, new, "touch popout focus grab")
+
+
+def write_changed(path: Path, new: str, old: str) -> bool:
+    if new == old:
+        return False
+    backup(path)
+    tmp = path.with_suffix(path.suffix + ".tabletmode-new")
+    tmp.write_text(new)
+    tmp.replace(path)
+    return True
+
+
+def main() -> int:
+    missing = [p for p in (INTERACTIONS, CONTENT_WINDOW) if not p.exists()]
+    if missing:
+        print("tabletmode touch-popouts: Caelestia shell files not found", file=sys.stderr)
+        for path in missing:
+            print(f"  {path}", file=sys.stderr)
+        return 2
+
+    try:
+        interactions_old = INTERACTIONS.read_text()
+        content_old = CONTENT_WINDOW.read_text()
+        interactions_new = patch_interactions(interactions_old)
+        content_new = patch_content_window(content_old)
+
+        changed = False
+        changed |= write_changed(INTERACTIONS, interactions_new, interactions_old)
+        changed |= write_changed(CONTENT_WINDOW, content_new, content_old)
+    except (OSError, RuntimeError) as exc:
+        print(f"tabletmode touch-popouts: {exc}", file=sys.stderr)
+        return 1
+
+    print("changed" if changed else "ok")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
