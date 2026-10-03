@@ -18,6 +18,7 @@ be tuned.
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import os
 import re
@@ -206,6 +207,54 @@ DEFAULTS = {
     "disable_pointers_in_tablet": False,
     "notify": True,
 }
+
+
+# Linux input-event constants used only to recover the current hinge state
+# after the daemon or shell restarts. Hyprland still owns the live switch
+# bindings; this is the missing startup snapshot that prevents a folded device
+# from coming back as "laptop mode" until the hinge moves again.
+_IOC_READ = 2
+_EV_SW = 0x05
+_SW_TABLET_MODE = 0x01
+
+
+def _evio_read_request(nr: int, size: int) -> int:
+    # Linux _IOC(_IOC_READ, 'E', nr, size) on the x86_64 ABI Mirai uses.
+    return (_IOC_READ << 30) | (size << 16) | (ord("E") << 8) | nr
+
+
+def tablet_switch_state() -> bool | None:
+    """Return the current physical tablet-mode switch state when available."""
+    input_dir = Path("/dev/input")
+    if not input_dir.is_dir():
+        return None
+
+    for event in sorted(input_dir.glob("event*")):
+        try:
+            caps = bytearray(16)
+            state = bytearray(16)
+            with event.open("rb", buffering=0) as fh:
+                fcntl.ioctl(
+                    fh,
+                    _evio_read_request(0x20 + _EV_SW, len(caps)),
+                    caps,
+                    True,
+                )
+                supported = int.from_bytes(caps, "little")
+                if not (supported & (1 << _SW_TABLET_MODE)):
+                    continue
+
+                fcntl.ioctl(
+                    fh,
+                    _evio_read_request(0x1B, len(state)),
+                    state,
+                    True,
+                )
+                active = int.from_bytes(state, "little")
+                return bool(active & (1 << _SW_TABLET_MODE))
+        except (OSError, ValueError):
+            continue
+    return None
 
 
 def write_capture_transform(transform: int) -> None:
@@ -918,6 +967,7 @@ class Daemon:
         self.stopping = threading.Event()
 
         self.tablet_mode = False
+        self.initial_tablet_mode = tablet_switch_state()
         # Windows temporarily fitted above the keyboard, keyed by address and
         # carrying the fullscreen mode originally reported to the client.
         self._keyboard_fit_windows: dict[str, int] = {}
@@ -1261,11 +1311,9 @@ class Daemon:
             self.publish_osk(False, 0)
             self.grab.start(name, mode="open", bottom=0)
 
-    def set_tablet_mode(self, on: bool) -> dict:
+    def set_tablet_mode(self, on: bool, announce: bool = True) -> dict:
         with self.lock:
             unchanged = on == self.tablet_mode
-            if on and unchanged:
-                return {"ok": True, "tablet_mode": on, "note": "unchanged"}
             self.tablet_mode = on
             if not unchanged:
                 log(f"tablet mode {'on' if on else 'off'}")
@@ -1277,13 +1325,14 @@ class Daemon:
                     err = self.osk.start()
                     if err:
                         log(err)
-                notify(
-                    self.cfg,
-                    "Tablet mode",
-                    "Pull the handle at the bottom left up for the keyboard, "
-                    "push it back down to dismiss",
-                    "tablet_android",
-                )
+                if announce and not unchanged:
+                    notify(
+                        self.cfg,
+                        "Tablet mode",
+                        "Pull the handle at the bottom left up for the keyboard, "
+                        "push it back down to dismiss",
+                        "tablet_android",
+                    )
             else:
                 # Unconditional, and forced: this is the path that undoes
                 # anything tablet mode turned off, and it is the only thing
@@ -1295,12 +1344,13 @@ class Daemon:
                     if not self.rotation_locked and self.transform != NORMAL:
                         self.orientation = "normal"
                         self.apply_transform(NORMAL, reason="laptop mode")
-                    notify(
-                        self.cfg,
-                        "Laptop mode",
-                        "Keyboard and touchpad restored",
-                        "laptop_chromebook",
-                    )
+                    if announce:
+                        notify(
+                            self.cfg,
+                            "Laptop mode",
+                            "Keyboard and touchpad restored",
+                            "laptop_chromebook",
+                        )
             self.sync_handle()
             return {"ok": True, "tablet_mode": on}
 
@@ -1484,6 +1534,12 @@ class Daemon:
         srv.bind(str(SOCKET_PATH))
         srv.listen(8)
         srv.settimeout(0.5)
+
+        # Recover the real folded/unfolded state immediately after a shell or
+        # daemon restart. Without this, the daemon always started in laptop mode
+        # and the bottom-left keyboard handle disappeared until the hinge moved.
+        if self.initial_tablet_mode is not None:
+            self.set_tablet_mode(self.initial_tablet_mode, announce=False)
 
         poller = threading.Thread(target=self.poll_loop, daemon=True)
         poller.start()

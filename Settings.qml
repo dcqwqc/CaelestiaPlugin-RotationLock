@@ -65,6 +65,33 @@ SettingsObject {
         options: ["caelestia", "none"]
     }
 
+    property bool compactPortraitSettings: true
+    SettingMeta on compactPortraitSettings {
+        label: "Compact portrait settings"
+        description: "Shrink and reshape the Caelestia settings window automatically on portrait displays so every control stays reachable."
+        icon: "aspect_ratio"
+        inputType: SettingMeta.Switch
+    }
+
+    property bool blankLockScreen: true
+    SettingMeta on blankLockScreen {
+        label: "Blank lock screen"
+        description: "Turn the display off after a short idle period while the Caelestia lock screen is active. Touch or other input wakes it again."
+        icon: "screen_lock_portrait"
+        inputType: SettingMeta.Switch
+    }
+
+    property int lockScreenTimeoutSeconds: 15
+    SettingMeta on lockScreenTimeoutSeconds {
+        label: "Lock screen timeout"
+        description: "Seconds of inactivity before the display turns off on the lock screen."
+        icon: "timer"
+        inputType: SettingMeta.SpinBox
+        min: 5
+        max: 120
+        step: 5
+    }
+
     property bool disablePointersInTablet: false
     SettingMeta on disablePointersInTablet {
         label: "Disable keyboard and touchpad in tablet mode"
