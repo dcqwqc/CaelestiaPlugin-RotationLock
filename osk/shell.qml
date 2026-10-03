@@ -499,10 +499,9 @@ ShellRoot {
                         // Neutral grey is preview/hover only. Selection itself
                         // is communicated solely by the underline below.
                         color: hoverHandler.hovered ? root.toolbarKey : "transparent"
-                        opacity: hoverHandler.hovered ? 1 : 0
 
-                        Behavior on opacity {
-                            NumberAnimation { duration: 90 }
+                        Behavior on color {
+                            ColorAnimation { duration: 90 }
                         }
 
                         Text {
