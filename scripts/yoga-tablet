@@ -646,6 +646,8 @@ class Osk:
         self._flags: set[str] | None = None
         self._slide_lock = threading.Lock()
         self._slide_generation = 0
+        self._surface_x = 0
+        self._surface_y = 0
 
     @property
     def plugin_root(self) -> Path:
@@ -854,6 +856,7 @@ class Osk:
             return None
         return self._spawn(hidden=True)
 
+
     def stop(self) -> None:
         pid = self.proc.pid if self.proc is not None else None
         if self._alive():
@@ -880,35 +883,60 @@ class Osk:
             self.control_write_fd = None
         with self._slide_lock:
             self._slide_generation += 1
+        self._surface_x = 0
+        self._surface_y = 0
         self.visible = False
 
-    def _write_offset(self, offset: int) -> bool:
+    def _write_surface_offset(self, x: int, y: int) -> bool:
         fd = self.control_write_fd
         if fd is None:
             return False
         try:
-            os.write(fd, (f"offset {int(offset)}" + chr(10)).encode("ascii"))
+            os.write(
+                fd,
+                (f"offset {int(x)} {int(y)}" + chr(10)).encode("ascii"),
+            )
+            self._surface_x = int(x)
+            self._surface_y = int(y)
             return True
         except (BlockingIOError, BrokenPipeError, OSError):
             return False
 
-    def set_offset(self, offset: int) -> bool:
+    def set_surface_offset(self, x: int | None = None, y: int | None = None) -> bool:
         with self._slide_lock:
             self._slide_generation += 1
-        return self._write_offset(offset)
+            sx = self._surface_x if x is None else int(x)
+            sy = self._surface_y if y is None else int(y)
+        return self._write_surface_offset(sx, sy)
 
-    def animate_offset(self, start: int, end: int, duration_ms: int = 230) -> bool:
-        """Move the live layer-shell surface with the same OutCubic pager curve."""
+    def animate_surface(
+        self,
+        start_x: int | None = None,
+        end_x: int | None = None,
+        start_y: int | None = None,
+        end_y: int | None = None,
+        duration_ms: int = 230,
+        start_delay_ms: int = 0,
+    ) -> bool:
+        """Move the live surface with one shared OutCubic animation clock."""
         if self.control_write_fd is None or not self._alive():
             return False
         duration_ms = max(1, min(1000, int(duration_ms)))
-        start, end = int(start), int(end)
+        delay = max(0, min(250, int(start_delay_ms))) / 1000
+
+        sx = self._surface_x if start_x is None else int(start_x)
+        ex = sx if end_x is None else int(end_x)
+        sy = self._surface_y if start_y is None else int(start_y)
+        ey = sy if end_y is None else int(end_y)
+
         with self._slide_lock:
             self._slide_generation += 1
             generation = self._slide_generation
-        self._write_offset(start)
+        self._write_surface_offset(sx, sy)
 
         def run() -> None:
+            if delay:
+                time.sleep(delay)
             started = time.monotonic()
             frame = 1 / 90
             while True:
@@ -917,15 +945,49 @@ class Osk:
                         return
                 t = min(1.0, (time.monotonic() - started) / (duration_ms / 1000))
                 eased = 1 - (1 - t) ** 3
-                value = round(start + (end - start) * eased)
-                if not self._write_offset(value):
+                x = round(sx + (ex - sx) * eased)
+                y = round(sy + (ey - sy) * eased)
+                if not self._write_surface_offset(x, y):
                     return
                 if t >= 1:
                     return
                 time.sleep(frame)
 
-        threading.Thread(target=run, name="yoga-osk-slide", daemon=True).start()
+        threading.Thread(target=run, name="yoga-osk-surface-motion", daemon=True).start()
         return True
+
+    def set_offset(self, offset: int) -> bool:
+        return self.set_surface_offset(x=offset)
+
+    def animate_offset(self, start: int, end: int, duration_ms: int = 230) -> bool:
+        return self.animate_surface(
+            start_x=start,
+            end_x=end,
+            duration_ms=duration_ms,
+        )
+
+    def prepare_vertical_show(self, travel: int) -> bool:
+        """Place the hidden keyboard just below the screen before it maps."""
+        return self.set_surface_offset(y=-max(1, int(travel)))
+
+    def animate_vertical_show(self, travel: int, delay_ms: int = 0) -> bool:
+        travel = max(1, int(travel))
+        return self.animate_surface(
+            start_y=-travel,
+            end_y=0,
+            duration_ms=230,
+            start_delay_ms=delay_ms,
+        )
+
+    def animate_vertical_hide(self, travel: int, delay_ms: int = 0) -> bool:
+        travel = max(1, int(travel))
+        return self.animate_surface(
+            start_y=0,
+            end_y=-travel,
+            duration_ms=230,
+            start_delay_ms=delay_ms,
+        )
+
 
     def _signal(self, sig: int) -> bool:
         if not self._alive():
@@ -1034,6 +1096,27 @@ class Handle:
 
     def _alive(self) -> bool:
         return self.proc is not None and self.proc.poll() is None
+
+    def push_osk_state(self, visible: bool, inset: int) -> bool:
+        """Update the resident QML motion state directly; file watching is fallback."""
+        if not self._alive() or self.proc is None:
+            return False
+        try:
+            result = subprocess.run(
+                [
+                    "qs", "ipc", "--pid", str(self.proc.pid),
+                    "call", "yogaOsk", "setState",
+                    "1" if visible else "0", str(max(0, int(inset))),
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=0.25,
+                check=False,
+            )
+            return result.returncode == 0
+        except (OSError, subprocess.SubprocessError):
+            return False
+
 
     def _env(self, monitor: str | None, mode: str, bottom: int) -> dict:
         env = dict(os.environ)
@@ -1479,8 +1562,11 @@ class Daemon:
             self.set_fullscreen_state(address, 2, 2)
 
     def publish_osk(self, visible: bool, inset: int) -> None:
-        """Hand the shell the keyboard's footprint."""
+        """Hand the shell the keyboard's footprint and motion state."""
         self.fit_fullscreen_above_keyboard(visible)
+        # The direct IPC is the animation trigger. The state file remains the
+        # durable recovery path for QML restarts and other shell consumers.
+        self.grab.push_osk_state(visible, inset)
         try:
             tmp = OSK_STATE_PATH.with_suffix(".tmp")
             with tmp.open("w") as fh:
@@ -1502,23 +1588,27 @@ class Daemon:
             index = command.index(flag)
             value = int(command[index + 1])
             if value > 0:
-                return value
+                # wvkbd deliberately floats 10 logical pixels above Caelestia's
+                # bottom edge reservation. The visual top-edge travel therefore
+                # includes that clearance as well as the configured key surface.
+                return value + 10
         except (ValueError, IndexError, TypeError):
             pass
         return 560 if self.transform % 2 else 400
 
-    def prepare_osk_show(self) -> None:
-        """Start shell furniture before wvkbd so both layer animations align."""
+    def prepare_osk_show(self) -> int:
+        """Prepare one shared vertical OSK+toolbar motion and return its travel."""
         if not self.tablet_mode:
-            return
+            return 0
         mon = pick_monitor(self.cfg)
         name = mon.get("name") if mon else None
         target = self.expected_osk_offset()
-        self.publish_osk(True, target)
+
+        # Keep wvkbd alive while hidden so its control fd already exists.
+        self.osk.start()
+        self.osk.prepare_vertical_show(target)
         self.grab.start(name, mode="close", bottom=target)
-        # The resident QML process sees OSK_STATE_PATH immediately; yield a
-        # single frame so its toolbar visibility change is queued before wvkbd.
-        time.sleep(0.016)
+        return target
 
     def sync_handle(self) -> None:
         """Put the grab strip wherever the keyboard currently isn't.
@@ -1690,18 +1780,42 @@ class Daemon:
                         "error": f"{self.osk.command[0]} is not installed",
                     }
                 prepared_show = False
+                vertical_travel = 0
                 if arg == "show":
                     if not self.osk.visible:
-                        self.prepare_osk_show()
+                        vertical_travel = self.prepare_osk_show()
                         prepared_show = True
                     err = self.osk.show()
+                    if err is None and prepared_show and vertical_travel:
+                        self.publish_osk(True, vertical_travel)
+                        self.osk.animate_vertical_show(vertical_travel, delay_ms=60)
+                        time.sleep(0.24)
                 elif arg == "hide":
+                    if self.osk.visible:
+                        vertical_travel = self.expected_osk_offset()
+                        self.publish_osk(False, 0)
+                        self.osk.animate_vertical_hide(vertical_travel, delay_ms=60)
+                        time.sleep(0.24)
                     err = self.osk.hide()
+                    if err is None:
+                        self.osk.set_surface_offset(y=0)
                 elif arg in (None, "toggle"):
                     if not self.osk.visible:
-                        self.prepare_osk_show()
+                        vertical_travel = self.prepare_osk_show()
                         prepared_show = True
-                    err = self.osk.toggle()
+                        err = self.osk.show()
+                        if err is None and vertical_travel:
+                            self.publish_osk(True, vertical_travel)
+                            self.osk.animate_vertical_show(vertical_travel, delay_ms=60)
+                            time.sleep(0.24)
+                    else:
+                        vertical_travel = self.expected_osk_offset()
+                        self.publish_osk(False, 0)
+                        self.osk.animate_vertical_hide(vertical_travel, delay_ms=60)
+                        time.sleep(0.24)
+                        err = self.osk.hide()
+                        if err is None:
+                            self.osk.set_surface_offset(y=0)
                 elif arg == "stop":
                     self.osk.stop()
                     err = None

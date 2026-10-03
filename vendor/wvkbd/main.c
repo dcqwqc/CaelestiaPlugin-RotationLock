@@ -84,6 +84,7 @@ static bool im_auto = false;
  * existing surface horizontally without changing its width or rebuilding it. */
 static int control_fd = -1;
 static int32_t horizontal_offset = 0;
+static int32_t vertical_offset = 0;
 
 /* event handler prototypes */
 static void wl_pointer_enter(void *data, struct wl_pointer *wl_pointer,
@@ -751,6 +752,7 @@ list_capabilities(void)
     puts("glide-fd");
     puts("control-fd");
     puts("horizontal-offset");
+    puts("vertical-offset");
     puts("primary-touch");
     puts("long-press-alternates");
     puts("layer-signals");
@@ -852,8 +854,8 @@ show()
 
     zwlr_layer_surface_v1_set_size(layer_surface, 0, height);
     zwlr_layer_surface_v1_set_anchor(layer_surface, anchor);
-    zwlr_layer_surface_v1_set_margin(layer_surface, 0, -horizontal_offset, 0,
-                                     horizontal_offset);
+    zwlr_layer_surface_v1_set_margin(layer_surface, 0, -horizontal_offset,
+                                     vertical_offset, horizontal_offset);
     if (keyboard.exclusive) {
         zwlr_layer_surface_v1_set_exclusive_zone(layer_surface, height);
     }
@@ -873,13 +875,14 @@ toggle_visibility()
 }
 
 static void
-set_horizontal_offset(int32_t offset)
+set_surface_offset(int32_t x, int32_t y)
 {
-    horizontal_offset = offset;
+    horizontal_offset = x;
+    vertical_offset = y;
     if (!layer_surface)
         return;
 
-    zwlr_layer_surface_v1_set_margin(layer_surface, 0, -offset, 0, offset);
+    zwlr_layer_surface_v1_set_margin(layer_surface, 0, -x, y, x);
     wl_surface_commit(draw_surf.surf);
 }
 
@@ -895,9 +898,11 @@ handle_control_fd(void)
     char *save = NULL;
     for (char *line = strtok_r(buf, "\n", &save); line;
          line = strtok_r(NULL, "\n", &save)) {
-        int offset = 0;
-        if (sscanf(line, "offset %d", &offset) == 1)
-            set_horizontal_offset(offset);
+        int x = 0, y = 0;
+        if (sscanf(line, "offset %d %d", &x, &y) == 2)
+            set_surface_offset(x, y);
+        else if (sscanf(line, "offset %d", &x) == 1)
+            set_surface_offset(x, vertical_offset);
     }
 }
 

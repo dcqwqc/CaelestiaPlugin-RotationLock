@@ -50,12 +50,29 @@ ShellRoot {
     property bool oskStateLoaded: false
     property bool oskStateVisible: false
     property real oskStateInset: 0
+    property real lastOskInset: 0
     readonly property bool closing: oskStateLoaded ? oskStateVisible : envClosing
     // In close mode this is the keyboard's height. Keep the handle immediately
     // ABOVE wvkbd instead of inside its surface.
     readonly property real bottomMargin: oskStateLoaded ? oskStateInset : envBottom
     readonly property real targetBottom: envNum("YOGA_OSK_TARGET_BOTTOM", 0)
     readonly property real effectiveBottom: bottomMargin > 0 ? bottomMargin : targetBottom
+
+    IpcHandler {
+        target: "yogaOsk"
+
+        function setState(visible: string, inset: string): string {
+            root.oskStateVisible = visible === "1";
+            const parsed = parseFloat(inset);
+            root.oskStateInset = root.oskStateVisible && !isNaN(parsed)
+                ? Math.max(0, parsed)
+                : 0;
+            if (root.oskStateInset > 0)
+                root.lastOskInset = root.oskStateInset;
+            root.oskStateLoaded = true;
+            return "ok";
+        }
+    }
 
     FileView {
         id: oskStateFile
@@ -68,6 +85,8 @@ ShellRoot {
                 const state = JSON.parse(text());
                 root.oskStateVisible = state.visible === true;
                 root.oskStateInset = root.oskStateVisible ? Math.max(0, Number(state.inset) || 0) : 0;
+                if (root.oskStateInset > 0)
+                    root.lastOskInset = root.oskStateInset;
                 root.oskStateLoaded = true;
             } catch (_) {
                 root.oskStateLoaded = false;
@@ -100,16 +119,17 @@ ShellRoot {
     readonly property real oskPadding: envNum("YOGA_OSK_PADDING", 8)
     readonly property int keyboardRows: (win.screen !== null && win.screen.height > win.screen.width) ? 6 : 5
     readonly property real toolbarRowWeight: 0.62
-    readonly property real toolbarHeight: closing && effectiveBottom > 0
-        ? Math.max(
-            52,
-            ((effectiveBottom - oskPadding * 2) * toolbarRowWeight
-                / (keyboardRows - 1 + toolbarRowWeight)) + oskPadding
-        )
-        : 52
+    readonly property real toolbarReferenceBottom: effectiveBottom > 0
+        ? effectiveBottom
+        : (lastOskInset > 0 ? lastOskInset : (keyboardRows === 6 ? 570 : 410))
+    readonly property real toolbarHeight: Math.max(
+        52,
+        ((toolbarReferenceBottom - oskPadding * 2) * toolbarRowWeight
+            / (keyboardRows - 1 + toolbarRowWeight)) + oskPadding
+    )
     readonly property real toolbarButtonHeight: Math.min(36, Math.max(30, toolbarHeight - 16))
     readonly property real toolbarBottom: Math.max(0, effectiveBottom - toolbarHeight)
-    property real toolbarLift: toolbarRaised ? toolbarBottom : 0
+    property real toolbarLift: toolbarRaised ? toolbarBottom : -toolbarHeight
 
     Behavior on toolbarLift {
         NumberAnimation {
