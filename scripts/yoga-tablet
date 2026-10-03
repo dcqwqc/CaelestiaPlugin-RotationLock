@@ -48,6 +48,10 @@ PLUGIN_SETTING_MAP = {
     "oskHandle": "osk_handle",
     "oskPreload": "osk_preload_in_tablet",
     "oskTheme": "osk_theme",
+    "glideEnabled": "glide_enabled",
+    "glideLanguage": "glide_language",
+    "oskToolbar": "osk_toolbar",
+    "oskClipboard": "osk_clipboard",
     "disablePointersInTablet": "disable_pointers_in_tablet",
     "notify": "notify",
 }
@@ -166,8 +170,8 @@ DEFAULTS = {
         # around it instead of being covered by it -- the screen simply gets
         # shorter while it is up. Caelestia's drawers are ExclusionMode.Ignore
         # and have to be told separately; that is what OSK_STATE_PATH is for.
-        "-L", "340",
-        "-H", "500",
+        "-L", "400",
+        "-H", "560",
     ],
     # Colour the keyboard from the live Caelestia scheme. "none" leaves
     # osk_command untouched so the wvkbd defaults apply.
@@ -200,6 +204,12 @@ DEFAULTS = {
     "osk_handle_width": 190,
     "osk_handle_height": 26,
     "osk_handle_threshold": 18,
+    # Glide is enabled only when the vendored binary, decoder, lexicon and
+    # wtype all validate at runtime. A missing dependency falls back to taps.
+    "glide_enabled": True,
+    "glide_language": "auto",  # auto | de | en
+    "osk_toolbar": True,
+    "osk_clipboard": True,
     # Off by default. The firmware already cuts the keyboard and touchpad when
     # the hinge folds, so having the compositor disable them too buys nothing
     # and risks stranding the machine with a dead keyboard if the un-fold event
@@ -626,9 +636,42 @@ class Osk:
     def __init__(self, cfg: dict):
         self.cfg = cfg
         self.proc: subprocess.Popen | None = None
+        self.decoder: subprocess.Popen | None = None
         self.visible = False
         self.fallback_restart = False
         self._flags: set[str] | None = None
+
+    @property
+    def plugin_root(self) -> Path:
+        return Path(__file__).resolve().parent.parent
+
+    @property
+    def glide_helper(self) -> Path:
+        return self.plugin_root / "scripts" / "glide-decoder.py"
+
+    def glide_available(self) -> bool:
+        """Only opt in once every part of the pipeline is usable.
+
+        This deliberately performs a cheap validation before handing wvkbd a
+        glide fd. If it fails, wvkbd retains its ordinary immediate tap path.
+        """
+        if not self.cfg.get("glide_enabled", True):
+            return False
+        if "--glide-fd" not in self.supported_flags() or not self.glide_helper.is_file():
+            return False
+        language = str(self.cfg.get("glide_language", "auto"))
+        if language not in ("auto", "de", "en"):
+            return False
+        try:
+            check = subprocess.run(
+                [sys.executable, str(self.glide_helper), "--validate"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=3,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return False
+        return check.returncode == 0
 
     @property
     def binary(self) -> str:
@@ -694,17 +737,57 @@ class Osk:
         cmd = self.command
         if not hidden:
             cmd = [c for c in cmd if c != "--hidden"]
+        read_fd: int | None = None
+        write_fd: int | None = None
+        use_glide = self.glide_available()
+        if use_glide:
+            try:
+                read_fd, write_fd = os.pipe()
+                cmd += ["--glide-fd", str(write_fd)]
+            except OSError:
+                if read_fd is not None:
+                    os.close(read_fd)
+                use_glide = False
         try:
             self.proc = subprocess.Popen(
                 cmd,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
                 start_new_session=True,
+                pass_fds=(write_fd,) if write_fd is not None else (),
             )
         except FileNotFoundError:
+            for fd in (read_fd, write_fd):
+                if fd is not None:
+                    os.close(fd)
             return f"{cmd[0]} is not installed"
         except OSError as exc:
+            for fd in (read_fd, write_fd):
+                if fd is not None:
+                    os.close(fd)
             return f"cannot start {cmd[0]}: {exc}"
+        if write_fd is not None:
+            os.close(write_fd)
+        if use_glide and read_fd is not None:
+            try:
+                self.decoder = subprocess.Popen(
+                    [
+                        sys.executable,
+                        str(self.glide_helper),
+                        "--language",
+                        str(self.cfg.get("glide_language", "auto")),
+                    ],
+                    stdin=read_fd,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                )
+            except OSError:
+                # Closing this end causes wvkbd's non-blocking writes to be
+                # dropped; ordinary taps remain unaffected.
+                pass
+            finally:
+                os.close(read_fd)
 
         # A rejected flag makes wvkbd exit immediately, which would otherwise
         # look exactly like a keyboard that silently refuses to appear.
@@ -722,6 +805,15 @@ class Osk:
         rc = self.proc.returncode
         clear_child_pid(OSK_PID_PATH, self.proc.pid)
         self.proc = None
+        # If wvkbd rejected an argument, its pipe closes too; do not leave the
+        # decoder orphaned waiting on a dead keyboard.
+        if self.decoder is not None and self.decoder.poll() is None:
+            self.decoder.terminate()
+            try:
+                self.decoder.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                self.decoder.kill()
+        self.decoder = None
         return f"{cmd[0]} exited immediately (status {rc}): {err or 'no output'}"
 
     def start(self) -> str | None:
@@ -740,6 +832,13 @@ class Osk:
                 self.proc.kill()
         clear_child_pid(OSK_PID_PATH, pid)
         self.proc = None
+        if self.decoder is not None and self.decoder.poll() is None:
+            self.decoder.terminate()
+            try:
+                self.decoder.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                self.decoder.kill()
+        self.decoder = None
         self.visible = False
 
     def _signal(self, sig: int) -> bool:
@@ -801,6 +900,19 @@ class Osk:
         if was_visible:
             self.show()
 
+    def select_layer(self, action: str) -> str | None:
+        """Select native keyboard/tools layers without adding a control socket."""
+        if action not in ("keyboard", "tools"):
+            return "toolbar takes keyboard|tools"
+        if not self._alive():
+            return "on-screen keyboard is not running"
+        try:
+            assert self.proc is not None
+            self.proc.send_signal(signal.SIGRTMIN + (2 if action == "keyboard" else 1))
+        except OSError:
+            return "on-screen keyboard is not running"
+        return None
+
 
 class Handle:
     """The bottom-left strip that pulls the keyboard up.
@@ -847,12 +959,24 @@ class Handle:
         env["YOGA_HANDLE_WIDTH"] = str(self.cfg.get("osk_handle_width", 190))
         env["YOGA_HANDLE_HEIGHT"] = str(self.cfg.get("osk_handle_height", 26))
         env["YOGA_HANDLE_THRESHOLD"] = str(self.cfg.get("osk_handle_threshold", 18))
+        env["YOGA_OSK_ACTION"] = str(self.PLUGIN_ROOT / "scripts" / "osk-action")
+        env["YOGA_TOOLBAR_ENABLED"] = "1" if self.cfg.get("osk_toolbar", True) else "0"
+        env["YOGA_CLIPBOARD_ENABLED"] = "1" if self.cfg.get("osk_clipboard", True) else "0"
+        env["YOGA_OSK_PADDING"] = str(self.cfg.get("osk_padding", 8))
         # Same neutral greys the keypress highlight uses, for the same reason:
         # this is furniture, not an accent.
         colours = scheme_colours() or {}
         for var, role in (
             ("YOGA_HANDLE_COLOUR", "outlineVariant"),
             ("YOGA_HANDLE_COLOUR_ACTIVE", "onSurfaceVariant"),
+        ):
+            value = colours.get(role)
+            if isinstance(value, str) and value:
+                env[var] = "#" + value.lstrip("#")
+        for var, role in (
+            ("YOGA_TOOLBAR_SURFACE", "surfaceContainer"),
+            ("YOGA_TOOLBAR_KEY", "surfaceContainerHigh"),
+            ("YOGA_TOOLBAR_TEXT", "onSurface"),
         ):
             value = colours.get(role)
             if isinstance(value, str) and value:
@@ -1371,6 +1495,11 @@ class Daemon:
                     "osk_running": self.osk._alive(),
                     "osk_visible": self.osk.visible,
                     "osk_available": self.osk.available(),
+                    "glide_requested": bool(self.cfg.get("glide_enabled", True)),
+                    "glide_available": self.osk.glide_available(),
+                    "glide_language": self.cfg.get("glide_language", "auto"),
+                    "toolbar_enabled": bool(self.cfg.get("osk_toolbar", True)),
+                    "clipboard_enabled": bool(self.cfg.get("osk_clipboard", True)),
                     "handle_running": self.grab._alive(),
                     "handle_state": self.grab.state,
                     "accelerometer": str(self.accel.base) if self.accel.base else None,
@@ -1460,6 +1589,15 @@ class Daemon:
                 self.sync_handle()
                 return {"ok": True, "osk_visible": self.osk.visible}
 
+        if cmd == "toolbar":
+            with self.lock:
+                if arg not in ("keyboard", "tools"):
+                    return {"ok": False, "error": "toolbar takes keyboard|tools"}
+                err = self.osk.select_layer(str(arg))
+                if err:
+                    return {"ok": False, "error": err}
+                return {"ok": True, "layer": arg}
+
         if cmd == "swap-sides":
             with self.lock:
                 self.cfg["invert_sides"] = not self.cfg.get("invert_sides", False)
@@ -1502,6 +1640,10 @@ class Daemon:
                 self.grab.cfg = self.cfg
                 self.grab.stop()
                 self.sync_handle()
+                # Settings that change the inherited glide fd or toolbar
+                # environment need a fresh child; preserve visibility.
+                if self.osk._alive():
+                    self.osk.reflow()
                 return {"ok": True}
 
         if cmd == "quit":
@@ -1636,6 +1778,8 @@ def main() -> int:
     p_osk.add_argument(
         "action", nargs="?", default="toggle", choices=["show", "hide", "toggle", "stop"]
     )
+    p_toolbar = sub.add_parser("toolbar", help="select a native keyboard toolbar layer")
+    p_toolbar.add_argument("action", choices=["keyboard", "tools"])
 
     args = parser.parse_args()
 
@@ -1657,6 +1801,8 @@ def main() -> int:
         reply = send({"cmd": "rotate", "arg": args.angle})
     elif args.cmd == "osk":
         reply = send({"cmd": "osk", "arg": args.action})
+    elif args.cmd == "toolbar":
+        reply = send({"cmd": "toolbar", "arg": args.action})
     else:
         reply = send({"cmd": args.cmd})
 

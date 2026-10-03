@@ -65,6 +65,39 @@ SettingsObject {
         options: ["caelestia", "none"]
     }
 
+    property bool glideEnabled: true
+    SettingMeta on glideEnabled {
+        label: "Glide typing"
+        description: "Drag across letters to predict one word. It automatically falls back to normal taps unless the local decoder and input bridge validate."
+        icon: "gesture"
+        inputType: SettingMeta.Switch
+    }
+
+    property string glideLanguage: "auto"
+    SettingMeta on glideLanguage {
+        label: "Glide language"
+        description: "Use local dictionaries for German and English when available; Auto considers both."
+        icon: "translate"
+        inputType: SettingMeta.SplitButton
+        options: ["auto", "de", "en"]
+    }
+
+    property bool oskToolbar: true
+    SettingMeta on oskToolbar {
+        label: "Keyboard utility row"
+        description: "Show Keyboard, Clipboard, Emoji, Tools, Protocol7, and Hide controls inside the keyboard footprint."
+        icon: "toolbar"
+        inputType: SettingMeta.Switch
+    }
+
+    property bool oskClipboard: true
+    SettingMeta on oskClipboard {
+        label: "Clipboard keyboard tab"
+        description: "Allow the utility row to show up to eight recent text clips when cliphist and wl-clipboard are installed."
+        icon: "content_paste"
+        inputType: SettingMeta.Switch
+    }
+
     property bool compactPortraitSettings: true
     SettingMeta on compactPortraitSettings {
         label: "Compact portrait settings"

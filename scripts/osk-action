@@ -1,0 +1,164 @@
+#!/usr/bin/env python3
+"""Small, argv-only actions used by the TabletMode keyboard toolbar.
+
+Clipboard data is intentionally never written to a log or evaluated as code.
+The only stdout carrying clipboard text is the private JSON response consumed
+by the toolbar process itself.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+MAX_CLIPS = 8
+MAX_PREVIEW = 180
+
+
+def available() -> bool:
+    return all(shutil.which(binary) for binary in ("cliphist", "wl-copy", "wl-paste", "wtype"))
+
+
+def clipboard_list() -> int:
+    if not available():
+        print(json.dumps({"available": False, "items": []}))
+        return 0
+    try:
+        result = subprocess.run(["cliphist", "list"], check=False, timeout=2,
+                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                text=True, encoding="utf-8", errors="replace")
+    except (OSError, subprocess.SubprocessError):
+        print(json.dumps({"available": False, "items": []}))
+        return 0
+    items = []
+    for line in result.stdout.splitlines():
+        match = re.match(r"^(\d+)\s+(.*)$", line, re.DOTALL)
+        if not match:
+            continue
+        # A bounded display preview only. The id is validated again before
+        # decoding, and clipboard text never becomes an argument or command.
+        preview = " ".join(match.group(2).split())[:MAX_PREVIEW]
+        if preview.startswith("[[ binary data"):
+            continue
+        items.append({"id": match.group(1), "preview": preview})
+        if len(items) == MAX_CLIPS:
+            break
+    print(json.dumps({"available": True, "items": items}, ensure_ascii=False))
+    return 0
+
+
+def clipboard_paste(clip_id: str) -> int:
+    if not available() or not re.fullmatch(r"\d+", clip_id):
+        return 1
+    try:
+        decoded = subprocess.run(["cliphist", "decode", clip_id], check=False,
+                                 timeout=2, stdout=subprocess.PIPE,
+                                 stderr=subprocess.DEVNULL)
+        if decoded.returncode != 0:
+            return 1
+        copied = subprocess.run(["wl-copy", "--type", "text/plain;charset=utf-8"],
+                                input=decoded.stdout, check=False, timeout=2,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if copied.returncode != 0:
+            return 1
+        pasted = subprocess.run(["wtype", "-M", "ctrl", "-k", "v", "-m", "ctrl"],
+                                check=False, timeout=2, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL)
+        return 0 if pasted.returncode == 0 else 1
+    except (OSError, subprocess.SubprocessError):
+        return 1
+
+
+def emoji(value: str) -> int:
+    # Curated toolbar choices are one grapheme or a short emoji sequence.
+    if not value or len(value) > 16 or any(ord(char) < 0x20 for char in value):
+        return 1
+    try:
+        result = subprocess.run(["wtype", "--", value], check=False, timeout=2,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return 0 if result.returncode == 0 else 1
+    except (OSError, subprocess.SubprocessError):
+        return 1
+
+
+def protocol7() -> int:
+    """Use Protocol7's configured evdev hotkey compatibility bridge.
+
+    Its installed IPC exports `debug()` only, not a dictation method. ydotool
+    writes validated Linux key events through uinput so Protocol7's physical
+    hotkey listener receives the same configured sequence without focus moves.
+    """
+    if not shutil.which("ydotool"):
+        return 1
+    path = Path.home() / ".config" / "protocol-7" / "config.json"
+    try:
+        config = json.loads(path.read_text(encoding="utf-8"))
+        keys = config.get("hotkey_keycode", [29, 29])
+        if isinstance(keys, int):
+            keys = [keys]
+        if not isinstance(keys, list) or not keys or len(keys) > 8:
+            return 1
+        values = [int(key) for key in keys]
+    except (OSError, ValueError, TypeError):
+        return 1
+    if any(key < 1 or key > 767 for key in values):
+        return 1
+    try:
+        # Protocol7 treats a repeated-key list (the default is [29, 29]) as a
+        # multi-tap sequence, not a simultaneous combo. Its listener rejects
+        # duplicate/echoed releases closer than 40 ms, so preserve the same
+        # semantics here instead of sending both downs together.
+        if len(set(values)) == 1:
+            for index, key in enumerate(values):
+                result = subprocess.run(
+                    ["ydotool", "key", f"{key}:1", f"{key}:0"],
+                    check=False,
+                    timeout=2,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                if result.returncode != 0:
+                    return 1
+                if index + 1 < len(values):
+                    time.sleep(0.06)
+            return 0
+
+        # Distinct configured keys are a simultaneous combo: press all, then
+        # release in reverse order like a physical chord.
+        events = [f"{key}:1" for key in values] + [
+            f"{key}:0" for key in reversed(values)
+        ]
+        result = subprocess.run(
+            ["ydotool", "key", *events],
+            check=False,
+            timeout=2,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        return 0 if result.returncode == 0 else 1
+    except (OSError, subprocess.SubprocessError):
+        return 1
+
+
+def main() -> int:
+    if len(sys.argv) < 2:
+        return 2
+    command = sys.argv[1]
+    if command == "clipboard-list" and len(sys.argv) == 2:
+        return clipboard_list()
+    if command == "clipboard-paste" and len(sys.argv) == 3:
+        return clipboard_paste(sys.argv[2])
+    if command == "emoji" and len(sys.argv) == 3:
+        return emoji(sys.argv[2])
+    if command == "protocol7" and len(sys.argv) == 2:
+        return protocol7()
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
