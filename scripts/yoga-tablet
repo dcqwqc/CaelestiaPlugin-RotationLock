@@ -1516,24 +1516,55 @@ class Daemon:
 
     def sample_orientation(self) -> str:
         """Refresh orientation synchronously for user-triggered unlocks."""
+        # The Intel ISH can disappear and re-enumerate after suspend or a
+        # firmware reset. Never make a missing sensor at daemon start permanent.
+        if self.accel.base is None:
+            self.accel.rediscover()
         g = self.accel.read_g()
+        if g is None:
+            self.accel.rediscover()
+            g = self.accel.read_g()
         if g is not None:
             self.orientation = self.orientation_from(g)
         self._candidate, self._candidate_hits = None, 0
         return self.orientation
 
     def poll_loop(self) -> None:
-        if self.accel.base is None:
-            log("no accelerometer found; rotation disabled")
-            return
-        log(f"accelerometer: {self.accel.base}")
         interval = float(self.cfg.get("poll_interval", 0.25))
         need = int(self.cfg.get("stable_samples", 4))
+        rediscover_every = max(1, int(round(2.0 / max(interval, 0.05))))
+        missing_ticks = rediscover_every
+        missing_logged = False
 
         while not self.stopping.wait(interval):
+            if self.accel.base is None or missing_ticks >= rediscover_every:
+                old_base = self.accel.base
+                self.accel.rediscover()
+                missing_ticks = 0
+                if self.accel.base is not None and self.accel.base != old_base:
+                    log(f"accelerometer recovered: {self.accel.base}")
+                    missing_logged = False
+
+            if self.accel.base is None:
+                if not missing_logged:
+                    log("no accelerometer found; waiting for it to recover")
+                    missing_logged = True
+                missing_ticks += 1
+                continue
+
             g = self.accel.read_g()
             if g is None:
+                if not missing_logged:
+                    log("accelerometer read path disappeared; rediscovering")
+                    missing_logged = True
+                missing_ticks += 1
                 continue
+
+            if missing_logged:
+                log(f"accelerometer healthy again: {self.accel.base}")
+                missing_logged = False
+            missing_ticks = 0
+
             with self.lock:
                 candidate = self.orientation_from(g)
                 if candidate == self.orientation:

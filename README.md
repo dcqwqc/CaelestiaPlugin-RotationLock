@@ -6,6 +6,7 @@ The plugin provides:
 
 - tablet-mode state integration for foldable/convertible hardware
 - accelerometer-driven auto-rotation through all four orientations
+- automatic accelerometer rediscovery if the Intel sensor hub disappears and later re-enumerates
 - matching touchscreen and pen transforms
 - rotation lock
 - an on-screen keyboard and tablet-mode input handling
