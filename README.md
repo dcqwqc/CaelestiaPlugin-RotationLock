@@ -47,9 +47,9 @@ private inherited control pipe drives its layer-shell x offset with the same
 longer looks like a static background swap. The transparent pager surface stays
 mapped and click-through while the keyboard page is active, which prevents the
 compositor from applying a second diagonal layer entrance when a utility page is
-selected. wvkbd itself runs on layer-shell `top`, while the resident toolbar,
-pager and grab handle stay on `overlay`; this keeps those controls permanently
-above the keyboard without delaying their entrance.
+selected. wvkbd itself runs on layer-shell `top`, while the resident toolbar
+and pager stay on `overlay`; this keeps those controls permanently above the
+keyboard without delaying their entrance.
 
 The toolbar's reserved native row uses 0.62 of a normal key-row height. The saved
 space is redistributed to the real key rows, keeping the keyboard footprint and

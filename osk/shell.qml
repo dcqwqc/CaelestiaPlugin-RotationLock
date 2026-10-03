@@ -13,11 +13,10 @@
 // layer-shell strip that occupies exactly the dead space at the bottom-left,
 // on the overlay layer so it sits above caelestia-drawers (which is on top).
 //
-// The daemon owns its lifetime and its mode. In tablet mode the strip is
-// always there: at the bottom of the screen while the keyboard is down (swipe
-// up to open it), and riding directly on top of wvkbd while it is up (swipe
-// down to put it away). Pull it up, push it down -- the same handle either
-// way, which is the only reason a strip this small is discoverable at all.
+// The daemon owns its lifetime. The separate edge strip exists only while the
+// keyboard is closed, where swiping up opens it. Once the keyboard is visible,
+// the close grabber moves into the toolbar header itself, so no floating strip
+// sits awkwardly between the application and the keyboard.
 
 import QtQuick
 import Quickshell
@@ -189,6 +188,21 @@ ShellRoot {
     // A swipe this far counts; anything shorter is treated as a tap. Both do
     // the same thing, so this only decides how early it fires.
     readonly property real dragThreshold: envNum("YOGA_HANDLE_THRESHOLD", 18)
+    property bool closeGrabberArmed: false
+
+    function triggerCloseGrabber(): void {
+        if (root.closeGrabberArmed || !root.closing)
+            return;
+        root.closeGrabberArmed = true;
+        Quickshell.execDetached([root.tabletBin, "osk", "hide"]);
+        closeGrabberDisarm.restart();
+    }
+
+    Timer {
+        id: closeGrabberDisarm
+        interval: 700
+        onTriggered: root.closeGrabberArmed = false
+    }
 
     // The first native wvkbd row is intentionally blank and becomes this
     // Gboard-style utility row. The auxiliary panes occupy the rest of the
@@ -563,8 +577,69 @@ ShellRoot {
         }
 
         Item {
+            id: closeGrabberHitbox
+
+            visible: root.toolbarRaised
+            anchors.horizontalCenter: parent.horizontalCenter
+            anchors.top: parent.top
+            anchors.topMargin: 2
+            width: 72
+            height: 16
+            z: 5
+
+            property real pressY: 0
+            property bool fired: false
+
+            Rectangle {
+                anchors.horizontalCenter: parent.horizontalCenter
+                anchors.top: parent.top
+                anchors.topMargin: 5
+                width: closeGrabberArea.pressed ? 44 : 38
+                height: closeGrabberArea.pressed ? 5 : 4
+                radius: height / 2
+                color: closeGrabberArea.pressed
+                    ? root.grabActiveColour
+                    : root.grabColour
+                opacity: closeGrabberArea.pressed ? 1 : 0.52
+
+                Behavior on width {
+                    NumberAnimation { duration: 110; easing.type: Easing.OutCubic }
+                }
+                Behavior on height {
+                    NumberAnimation { duration: 110; easing.type: Easing.OutCubic }
+                }
+                Behavior on opacity {
+                    NumberAnimation { duration: 110 }
+                }
+            }
+
+            MouseArea {
+                id: closeGrabberArea
+                anchors.fill: parent
+
+                onPressed: event => {
+                    closeGrabberHitbox.pressY = event.y;
+                    closeGrabberHitbox.fired = false;
+                }
+                onPositionChanged: event => {
+                    if (!pressed || closeGrabberHitbox.fired)
+                        return;
+                    if (event.y - closeGrabberHitbox.pressY >= root.dragThreshold) {
+                        closeGrabberHitbox.fired = true;
+                        root.triggerCloseGrabber();
+                    }
+                }
+                onReleased: {
+                    if (!closeGrabberHitbox.fired)
+                        root.triggerCloseGrabber();
+                }
+            }
+        }
+
+        Item {
             id: toolbarDeck
             anchors.centerIn: parent
+            anchors.verticalCenterOffset: 6
             width: toolbarRow.implicitWidth
             height: root.toolbarButtonHeight
             opacity: root.toolbarRaised ? 1 : 0
@@ -1210,6 +1285,9 @@ ShellRoot {
 
     PanelWindow {
         id: win
+        // This separate surface is now opening-only. Once the keyboard starts
+        // moving, the close affordance lives inside the toolbar header.
+        visible: !root.closing && !root.motionAnimating && root.motionInset <= 0.5
 
         screen: {
             if (root.output === "")
@@ -1241,7 +1319,7 @@ ShellRoot {
             if (win.armed)
                 return;
             win.armed = true;
-            Quickshell.execDetached([root.tabletBin, "osk", root.closing ? "hide" : "show"]);
+            Quickshell.execDetached([root.tabletBin, "osk", "show"]);
             disarm.restart();
         }
 
@@ -1256,9 +1334,7 @@ ShellRoot {
             id: grab
 
             anchors.horizontalCenter: parent.horizontalCenter
-            // In close mode the whole window sits just above the keyboard, so
-            // keep the grabber along its bottom edge. In open mode it stays on
-            // the screen's bottom edge as before.
+            // Opening-only edge handle. Closing lives in the toolbar header.
             anchors.bottom: parent.bottom
             anchors.bottomMargin: 7
 
@@ -1300,7 +1376,7 @@ ShellRoot {
             onPositionChanged: event => {
                 if (!pressed)
                     return;
-                const travelled = root.closing ? event.y - pressY : pressY - event.y;
+                const travelled = pressY - event.y;
                 if (travelled >= root.dragThreshold)
                     win.trigger();
             }
