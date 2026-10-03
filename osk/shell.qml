@@ -96,10 +96,15 @@ ShellRoot {
     readonly property bool clipboardEnabled: envStr("YOGA_CLIPBOARD_ENABLED", "1") === "1"
     readonly property real oskPadding: envNum("YOGA_OSK_PADDING", 8)
     readonly property int keyboardRows: (win.screen !== null && win.screen.height > win.screen.width) ? 6 : 5
+    readonly property real toolbarRowWeight: 0.62
     readonly property real toolbarHeight: closing && effectiveBottom > 0
-        ? Math.max(42, (effectiveBottom - oskPadding * 2) / keyboardRows)
-        : 42
-    readonly property real toolbarButtonHeight: Math.min(42, Math.max(34, toolbarHeight - 14))
+        ? Math.max(
+            52,
+            ((effectiveBottom - oskPadding * 2) * toolbarRowWeight
+                / (keyboardRows - 1 + toolbarRowWeight)) + oskPadding
+        )
+        : 52
+    readonly property real toolbarButtonHeight: Math.min(36, Math.max(30, toolbarHeight - 16))
     readonly property real toolbarBottom: Math.max(0, effectiveBottom - toolbarHeight)
     readonly property color toolbarSurface: envStr("YOGA_TOOLBAR_SURFACE", "#1b1b1f")
     readonly property color toolbarKey: envStr("YOGA_TOOLBAR_KEY", "#303034")
@@ -108,7 +113,6 @@ ShellRoot {
 
     property string pane: "keyboard"
     property string nativeLayer: "keyboard"
-    property bool pagerVisible: false
     property bool pagerTransitioning: false
     property bool pageAFront: true
     property string queuedPane: ""
@@ -139,6 +143,14 @@ ShellRoot {
         );
         return buttons;
     }
+    Component.onCompleted: {
+        // If this tiny shell process is ever restarted while wvkbd survives a
+        // transient failure, return the native page to its canonical position.
+        Qt.callLater(() => Quickshell.execDetached([
+            root.tabletBin, "pager", "keyboard-reset", "1", "1"
+        ]));
+    }
+
     readonly property var emojiCategories: [
         { id: "all", icon: "apps" },
         { id: "people", icon: "sentiment_satisfied" },
@@ -176,9 +188,6 @@ ShellRoot {
         root.pageAFront = !root.pageAFront;
         root.pagerTransitioning = false;
 
-        if (root.pane === "keyboard")
-            root.pagerVisible = false;
-
         if (root.queuedPane !== "") {
             const queued = root.queuedPane;
             root.queuedPane = "";
@@ -208,7 +217,21 @@ ShellRoot {
         const incoming = root.pageAFront ? pageB : pageA;
         const travel = Math.max(1, auxiliaryPane.width);
 
-        root.pagerVisible = true;
+        // The native keyboard is a separate layer-shell surface. Move that real
+        // surface with the same horizontal curve as the QML pages so keyboard is
+        // a first-class member of the cycle rather than a static backdrop.
+        if (root.pane === "keyboard" && nextPane !== "keyboard") {
+            Quickshell.execDetached([
+                root.tabletBin, "pager", "keyboard-out-left",
+                String(Math.round(travel)), "230"
+            ]);
+        } else if (root.pane !== "keyboard" && nextPane === "keyboard") {
+            Quickshell.execDetached([
+                root.tabletBin, "pager", "keyboard-in-left",
+                String(Math.round(travel)), "230"
+            ]);
+        }
+
         outgoing.visible = true;
         outgoing.animateX = false;
         outgoing.x = 0;
@@ -401,7 +424,7 @@ ShellRoot {
 
         Row {
             anchors.centerIn: parent
-            spacing: 7
+            spacing: 5
 
             Repeater {
                 model: root.toolbarButtons
@@ -409,14 +432,14 @@ ShellRoot {
                 delegate: Item {
                     required property var modelData
                     readonly property bool active: root.toolbarActive(modelData.id)
-                    width: 48
+                    width: 44
                     height: root.toolbarButtonHeight
 
                     Rectangle {
                         anchors.centerIn: parent
-                        width: 42
-                        height: 34
-                        radius: 17
+                        width: 38
+                        height: 30
+                        radius: 15
                         color: parent.active
                             ? root.toolbarKey
                             : (iconArea.pressed ? root.toolbarKey : "transparent")
@@ -427,7 +450,7 @@ ShellRoot {
                             text: modelData.icon
                             color: root.toolbarText
                             font.family: "Material Symbols Rounded"
-                            font.pixelSize: 22
+                            font.pixelSize: 21
                         }
 
                         MouseArea {
@@ -937,7 +960,7 @@ ShellRoot {
 
     PanelWindow {
         id: auxiliaryPane
-        visible: root.toolbarVisible && root.pagerVisible
+        visible: root.toolbarVisible
         screen: win.screen
         WlrLayershell.layer: WlrLayer.Overlay
         WlrLayershell.namespace: "yoga-osk-pager"
@@ -950,6 +973,15 @@ ShellRoot {
         implicitHeight: root.toolbarBottom
         exclusionMode: ExclusionMode.Ignore
         color: "transparent"
+        mask: pagerInputRegion
+
+        Region {
+            id: pagerInputRegion
+            width: root.pane === "keyboard" && !root.pagerTransitioning
+                ? 0 : auxiliaryPane.width
+            height: root.pane === "keyboard" && !root.pagerTransitioning
+                ? 0 : auxiliaryPane.height
+        }
 
         Loader {
             id: pageA

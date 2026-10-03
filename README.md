@@ -41,11 +41,19 @@ user's physical dictation hotkey never changes the toolbar integration.
 Keyboard, clipboard, emoji and Protocol7 dictation history form one horizontal
 page deck underneath the fixed icon row. Moving right through the toolbar pushes
 the current page left while the next page enters from the right; moving back
-reverses the motion. The keyboard page is transparent so sliding a utility page
-away progressively reveals the resident native wvkbd beneath it instead of
-restarting the keyboard. wvkbd itself runs on layer-shell `top`, while the
-resident toolbar, pager and grab handle stay on `overlay`; this keeps those
-controls permanently above the keyboard without delaying their entrance.
+reverses the motion. The real native wvkbd surface is part of that motion: a
+private inherited control pipe drives its layer-shell x offset with the same
+230 ms OutCubic curve as the QML pages, so keyboard ↔ clipboard/emoji/history no
+longer looks like a static background swap. The transparent pager surface stays
+mapped and click-through while the keyboard page is active, which prevents the
+compositor from applying a second diagonal layer entrance when a utility page is
+selected. wvkbd itself runs on layer-shell `top`, while the resident toolbar,
+pager and grab handle stay on `overlay`; this keeps those controls permanently
+above the keyboard without delaying their entrance.
+
+The toolbar's reserved native row uses 0.62 of a normal key-row height. The saved
+space is redistributed to the real key rows, keeping the keyboard footprint and
+window-resize inset unchanged while making the icon bar visibly tighter.
 Clipboard history is searchable and uses `cliphist`;
 dictation history reads Protocol7's existing
 `~/.config/protocol-7/history.json` rather than creating another database. The

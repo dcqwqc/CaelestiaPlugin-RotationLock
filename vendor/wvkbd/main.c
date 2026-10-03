@@ -79,6 +79,11 @@ static uint32_t height, normal_height, landscape_height;
 static int rounding = DEFAULT_ROUNDING;
 static bool hidden = false;
 static bool im_auto = false;
+/* TabletMode page-deck control channel. The parent writes tiny newline-delimited
+ * commands such as "offset -830". Equal-and-opposite layer margins move the
+ * existing surface horizontally without changing its width or rebuilding it. */
+static int control_fd = -1;
+static int32_t horizontal_offset = 0;
 
 /* event handler prototypes */
 static void wl_pointer_enter(void *data, struct wl_pointer *wl_pointer,
@@ -725,6 +730,7 @@ usage(char *argv0)
                     " windows. Do not request an exclusive zone from the"
                     "compositor\n");
     fprintf(stderr, "  --glide-fd [fd]     - Write completed alphabetic glide paths to fd\n");
+    fprintf(stderr, "  --control-fd [fd]   - Read TabletMode surface control commands from fd\n");
     fprintf(stderr, "  --capabilities      - Print TabletMode extension capabilities\n");
 }
 
@@ -743,6 +749,8 @@ static void
 list_capabilities(void)
 {
     puts("glide-fd");
+    puts("control-fd");
+    puts("horizontal-offset");
     puts("primary-touch");
     puts("long-press-alternates");
     puts("layer-signals");
@@ -844,6 +852,8 @@ show()
 
     zwlr_layer_surface_v1_set_size(layer_surface, 0, height);
     zwlr_layer_surface_v1_set_anchor(layer_surface, anchor);
+    zwlr_layer_surface_v1_set_margin(layer_surface, 0, -horizontal_offset, 0,
+                                     horizontal_offset);
     if (keyboard.exclusive) {
         zwlr_layer_surface_v1_set_exclusive_zone(layer_surface, height);
     }
@@ -860,6 +870,35 @@ toggle_visibility()
         show();
     else
         hide();
+}
+
+static void
+set_horizontal_offset(int32_t offset)
+{
+    horizontal_offset = offset;
+    if (!layer_surface)
+        return;
+
+    zwlr_layer_surface_v1_set_margin(layer_surface, 0, -offset, 0, offset);
+    wl_surface_commit(draw_surf.surf);
+}
+
+static void
+handle_control_fd(void)
+{
+    char buf[128];
+    ssize_t n = read(control_fd, buf, sizeof(buf) - 1);
+    if (n <= 0)
+        return;
+    buf[n] = '\0';
+
+    char *save = NULL;
+    for (char *line = strtok_r(buf, "\n", &save); line;
+         line = strtok_r(NULL, "\n", &save)) {
+        int offset = 0;
+        if (sscanf(line, "offset %d", &offset) == 1)
+            set_horizontal_offset(offset);
+    }
 }
 
 void
@@ -1153,6 +1192,19 @@ main(int argc, char **argv)
             if (flags >= 0)
                 fcntl(keyboard.glide_fd, F_SETFL, flags | O_NONBLOCK);
             keyboard.glide_enabled = true;
+        } else if (!strcmp(argv[i], "--control-fd")) {
+            if (i >= argc - 1) {
+                usage(argv[0]);
+                exit(1);
+            }
+            control_fd = atoi(argv[++i]);
+            if (control_fd < 0) {
+                fprintf(stderr, "--control-fd needs a non-negative inherited fd\n");
+                exit(1);
+            }
+            int flags = fcntl(control_fd, F_GETFL);
+            if (flags >= 0)
+                fcntl(control_fd, F_SETFL, flags | O_NONBLOCK);
         } else if ((!strcmp(argv[i], "-non-exclusive")) || (!strcmp(argv[i], "--non-exclusive"))) {
             keyboard.exclusive = false;
         } else if ((!strcmp(argv[i], "-auto")) ||
@@ -1252,11 +1304,14 @@ main(int argc, char **argv)
     if (!hidden)
         show();
 
-    struct pollfd fds[2];
+    struct pollfd fds[3];
     int WAYLAND_FD = 0;
     int SIGNAL_FD = 1;
+    int CONTROL_FD = 2;
     fds[WAYLAND_FD].events = POLLIN;
     fds[SIGNAL_FD].events = POLLIN;
+    fds[CONTROL_FD].events = control_fd >= 0 ? POLLIN : 0;
+    fds[CONTROL_FD].fd = control_fd;
 
     fds[WAYLAND_FD].fd = wl_display_get_fd(display);
     if (fds[WAYLAND_FD].fd == -1) {
@@ -1282,7 +1337,7 @@ main(int argc, char **argv)
 
     while (run_display) {
         wl_display_flush(display);
-        poll(fds, 2, -1);
+        poll(fds, 3, -1);
 
         if (fds[WAYLAND_FD].revents & POLLIN)
             wl_display_dispatch(display);
@@ -1310,6 +1365,15 @@ main(int argc, char **argv)
                 select_primary_layer();
             else if (si.ssi_signo == SIGPIPE)
                 pipewarn();
+        }
+        if (control_fd >= 0 && (fds[CONTROL_FD].revents & POLLIN))
+            handle_control_fd();
+        if (control_fd >= 0 &&
+            (fds[CONTROL_FD].revents & (POLLHUP | POLLERR | POLLNVAL))) {
+            close(control_fd);
+            control_fd = -1;
+            fds[CONTROL_FD].fd = -1;
+            fds[CONTROL_FD].events = 0;
         }
     }
 

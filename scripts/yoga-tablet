@@ -640,9 +640,12 @@ class Osk:
         self.cfg = cfg
         self.proc: subprocess.Popen | None = None
         self.decoder: subprocess.Popen | None = None
+        self.control_write_fd: int | None = None
         self.visible = False
         self.fallback_restart = False
         self._flags: set[str] | None = None
+        self._slide_lock = threading.Lock()
+        self._slide_generation = 0
 
     @property
     def plugin_root(self) -> Path:
@@ -742,6 +745,8 @@ class Osk:
             cmd = [c for c in cmd if c != "--hidden"]
         read_fd: int | None = None
         write_fd: int | None = None
+        control_read_fd: int | None = None
+        control_write_fd: int | None = None
         use_glide = self.glide_available()
         if use_glide:
             try:
@@ -751,26 +756,45 @@ class Osk:
                 if read_fd is not None:
                     os.close(read_fd)
                 use_glide = False
+
+        if "--control-fd" in self.supported_flags():
+            try:
+                control_read_fd, control_write_fd = os.pipe()
+                os.set_blocking(control_write_fd, False)
+                cmd += ["--control-fd", str(control_read_fd)]
+            except OSError:
+                for fd in (control_read_fd, control_write_fd):
+                    if fd is not None:
+                        os.close(fd)
+                control_read_fd = None
+                control_write_fd = None
+
+        pass_fds = tuple(
+            fd for fd in (write_fd, control_read_fd) if fd is not None
+        )
         try:
             self.proc = subprocess.Popen(
                 cmd,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
                 start_new_session=True,
-                pass_fds=(write_fd,) if write_fd is not None else (),
+                pass_fds=pass_fds,
             )
         except FileNotFoundError:
-            for fd in (read_fd, write_fd):
+            for fd in (read_fd, write_fd, control_read_fd, control_write_fd):
                 if fd is not None:
                     os.close(fd)
             return f"{cmd[0]} is not installed"
         except OSError as exc:
-            for fd in (read_fd, write_fd):
+            for fd in (read_fd, write_fd, control_read_fd, control_write_fd):
                 if fd is not None:
                     os.close(fd)
             return f"cannot start {cmd[0]}: {exc}"
         if write_fd is not None:
             os.close(write_fd)
+        if control_read_fd is not None:
+            os.close(control_read_fd)
+        self.control_write_fd = control_write_fd
         if use_glide and read_fd is not None:
             try:
                 self.decoder = subprocess.Popen(
@@ -817,6 +841,12 @@ class Osk:
             except subprocess.TimeoutExpired:
                 self.decoder.kill()
         self.decoder = None
+        if self.control_write_fd is not None:
+            try:
+                os.close(self.control_write_fd)
+            except OSError:
+                pass
+            self.control_write_fd = None
         return f"{cmd[0]} exited immediately (status {rc}): {err or 'no output'}"
 
     def start(self) -> str | None:
@@ -842,7 +872,60 @@ class Osk:
             except subprocess.TimeoutExpired:
                 self.decoder.kill()
         self.decoder = None
+        if self.control_write_fd is not None:
+            try:
+                os.close(self.control_write_fd)
+            except OSError:
+                pass
+            self.control_write_fd = None
+        with self._slide_lock:
+            self._slide_generation += 1
         self.visible = False
+
+    def _write_offset(self, offset: int) -> bool:
+        fd = self.control_write_fd
+        if fd is None:
+            return False
+        try:
+            os.write(fd, (f"offset {int(offset)}" + chr(10)).encode("ascii"))
+            return True
+        except (BlockingIOError, BrokenPipeError, OSError):
+            return False
+
+    def set_offset(self, offset: int) -> bool:
+        with self._slide_lock:
+            self._slide_generation += 1
+        return self._write_offset(offset)
+
+    def animate_offset(self, start: int, end: int, duration_ms: int = 230) -> bool:
+        """Move the live layer-shell surface with the same OutCubic pager curve."""
+        if self.control_write_fd is None or not self._alive():
+            return False
+        duration_ms = max(1, min(1000, int(duration_ms)))
+        start, end = int(start), int(end)
+        with self._slide_lock:
+            self._slide_generation += 1
+            generation = self._slide_generation
+        self._write_offset(start)
+
+        def run() -> None:
+            started = time.monotonic()
+            frame = 1 / 90
+            while True:
+                with self._slide_lock:
+                    if generation != self._slide_generation:
+                        return
+                t = min(1.0, (time.monotonic() - started) / (duration_ms / 1000))
+                eased = 1 - (1 - t) ** 3
+                value = round(start + (end - start) * eased)
+                if not self._write_offset(value):
+                    return
+                if t >= 1:
+                    return
+                time.sleep(frame)
+
+        threading.Thread(target=run, name="yoga-osk-slide", daemon=True).start()
+        return True
 
     def _signal(self, sig: int) -> bool:
         if not self._alive():
@@ -1632,6 +1715,23 @@ class Daemon:
                 self.sync_handle()
                 return {"ok": True, "osk_visible": self.osk.visible}
 
+        if cmd == "pager":
+            action = str(arg or "")
+            try:
+                width = max(1, int(req.get("width", 1)))
+                duration = max(1, min(1000, int(req.get("duration", 230))))
+            except (TypeError, ValueError):
+                return {"ok": False, "error": "pager needs integer width/duration"}
+            if action == "keyboard-out-left":
+                ok = self.osk.animate_offset(0, -width, duration)
+            elif action == "keyboard-in-left":
+                ok = self.osk.animate_offset(-width, 0, duration)
+            elif action == "keyboard-reset":
+                ok = self.osk.set_offset(0)
+            else:
+                return {"ok": False, "error": "pager takes keyboard-out-left|keyboard-in-left|keyboard-reset"}
+            return {"ok": ok, "action": action, "width": width, "duration": duration}
+
         if cmd == "toolbar":
             with self.lock:
                 if arg not in ("keyboard", "tools"):
@@ -1823,6 +1923,10 @@ def main() -> int:
     )
     p_toolbar = sub.add_parser("toolbar", help="select a native keyboard toolbar layer")
     p_toolbar.add_argument("action", choices=["keyboard", "tools"])
+    p_pager = sub.add_parser("pager", help="animate the native keyboard inside the mode pager")
+    p_pager.add_argument("action", choices=["keyboard-out-left", "keyboard-in-left", "keyboard-reset"])
+    p_pager.add_argument("width", type=int)
+    p_pager.add_argument("duration", nargs="?", type=int, default=230)
 
     args = parser.parse_args()
 
@@ -1846,6 +1950,13 @@ def main() -> int:
         reply = send({"cmd": "osk", "arg": args.action})
     elif args.cmd == "toolbar":
         reply = send({"cmd": "toolbar", "arg": args.action})
+    elif args.cmd == "pager":
+        reply = send({
+            "cmd": "pager",
+            "arg": args.action,
+            "width": args.width,
+            "duration": args.duration,
+        })
     else:
         reply = send({"cmd": args.cmd})
 

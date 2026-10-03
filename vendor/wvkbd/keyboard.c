@@ -218,14 +218,32 @@ kbd_init_layout(struct layout *l, uint32_t width, uint32_t height,
     if (height > padding * 2)
         height -= padding * 2;
 
-    l->keyheight = height / rows;
+    /* TabletMode's four primary/tool layouts reserve their first row for the
+       external QML toolbar. Give that spacer only 0.62 of a normal row and
+       redistribute the saved height across the real key rows. This keeps the
+       total exclusive-zone footprint unchanged while removing dead whitespace. */
+    bool compact_toolbar_row = l->name &&
+        (!strcmp(l->name, "full") || !strcmp(l->name, "special") ||
+         !strcmp(l->name, "landscape") || !strcmp(l->name, "landscapespecial"));
+    uint32_t toolbar_height = 0;
+    if (compact_toolbar_row && rows > 1) {
+        const double weight = 0.62;
+        toolbar_height = (uint32_t)((double)height * weight /
+                                    ((double)(rows - 1) + weight));
+        l->keyheight = (height - toolbar_height) / (rows - 1);
+    } else {
+        l->keyheight = height / rows;
+    }
 
     struct key *k = l->keys;
     double rowlength = kbd_get_row_length(k);
     double rowwidth = 0.0;
+    uint32_t current_height =
+        compact_toolbar_row ? toolbar_height : l->keyheight;
     while (k->type != Last) {
         if (k->type == EndRow) {
-            y += l->keyheight;
+            y += current_height;
+            current_height = l->keyheight;
             x = padding;
             rowwidth = 0.0;
             rowlength = kbd_get_row_length(k + 1);
@@ -240,7 +258,7 @@ kbd_init_layout(struct layout *l, uint32_t width, uint32_t height,
                 x++;
             }
         }
-        k->h = l->keyheight;
+        k->h = current_height;
         k++;
     }
 }
