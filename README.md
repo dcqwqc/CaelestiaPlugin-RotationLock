@@ -43,7 +43,10 @@ page deck underneath the fixed icon row. Moving right through the toolbar pushes
 the current page left while the next page enters from the right; moving back
 reverses the motion. The keyboard page is transparent so sliding a utility page
 away progressively reveals the resident native wvkbd beneath it instead of
-restarting the keyboard. Clipboard history is searchable and uses `cliphist`;
+restarting the keyboard. wvkbd itself runs on layer-shell `top`, while the
+resident toolbar, pager and grab handle stay on `overlay`; this keeps those
+controls permanently above the keyboard without delaying their entrance.
+Clipboard history is searchable and uses `cliphist`;
 dictation history reads Protocol7's existing
 `~/.config/protocol-7/history.json` rather than creating another database. The
 emoji browser searches the local Noctalia emoji catalogue (currently 1,913

@@ -190,7 +190,10 @@ DEFAULTS = {
     # An overlay remains reachable over a true fullscreen window. Do not fake
     # that by changing the application's fullscreen state: doing so couples two
     # independent controls and makes hiding the keyboard alter the window.
-    "osk_layer": "overlay",
+    # Keep wvkbd one layer below the resident toolbar/pager surfaces. If both
+    # use overlay, wvkbd maps later and Hyprland stacks it above the toolbar,
+    # making the bar appear briefly and then vanish underneath the keyboard.
+    "osk_layer": "top",
     # Start it hidden on fold so the first toggle is instant. It stays
     # invisible until something explicitly shows it.
     "osk_preload_in_tablet": True,
