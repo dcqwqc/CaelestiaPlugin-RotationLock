@@ -30,14 +30,17 @@ from a cache directory is required. Install it for the current user with:
 
 The normal layer keeps desktop essentials such as Esc, Ctrl, Alt, Super and Tab,
 while navigation keys, Insert/Delete and F1-F12 live on the desktop layer. A
-compact icon row stays visible for the whole lifetime of the OSK and switches
-between keyboard, clipboard, emoji, desktop controls and Protocol7 dictation
-history. The microphone is an action rather than a mode, so starting or stopping
-Protocol7 does not dismiss the keyboard or replace the current panel.
+compact icon row stays visible for the whole lifetime of the OSK. Its first
+button is the only keyboard/desktop-tools layer switcher, followed by clipboard,
+emoji, Protocol7 dictation history and voice input. The microphone is an action
+rather than a mode, so starting or stopping Protocol7 does not dismiss the
+keyboard or replace the current panel.
 
-Clipboard, emoji and dictation history are full keyboard-area panels: native
-keys are completely covered while the panel is open. Clipboard history is
-searchable and uses `cliphist`; dictation history reads Protocol7's existing
+Clipboard and emoji are full keyboard-area panels: native keys are completely
+covered while either panel is open. Protocol7 dictation history instead opens as
+a drawer above the OSK, so the full native keyboard remains visible and usable.
+Clipboard history is searchable and uses `cliphist`; dictation history reads
+Protocol7's existing
 `~/.config/protocol-7/history.json` rather than creating another database. The
 emoji browser searches the local Noctalia emoji catalogue (currently 1,913
 entries), exposes category filters and loads additional pages while scrolling.

@@ -89,16 +89,22 @@ ShellRoot {
     property var emojiItems: []
     property var emojiNext: null
     property var historyItems: []
+    property string pendingHistoryId: ""
+    property string pendingHistoryTimestamp: ""
 
     readonly property var toolbarButtons: {
         const buttons = [
-            { id: "keyboard", icon: "keyboard" }
+            {
+                id: "layer",
+                icon: root.pane === "keyboard" && root.nativeLayer === "tools"
+                    ? "keyboard"
+                    : "keyboard_command_key"
+            }
         ];
         if (root.clipboardEnabled)
             buttons.push({ id: "clipboard", icon: "content_paste" });
         buttons.push(
             { id: "emoji", icon: "emoji_emotions" },
-            { id: "tools", icon: "keyboard_command_key" },
             { id: "history", icon: "history" },
             { id: "mic", icon: "mic" }
         );
@@ -118,10 +124,8 @@ ShellRoot {
     ]
 
     function toolbarActive(id: string): bool {
-        if (id === "keyboard")
-            return root.pane === "keyboard" && root.nativeLayer === "keyboard";
-        if (id === "tools")
-            return root.pane === "keyboard" && root.nativeLayer === "tools";
+        if (id === "layer")
+            return root.pane === "keyboard";
         return root.pane === id;
     }
 
@@ -133,18 +137,28 @@ ShellRoot {
     }
 
     function runToolbar(action: string): void {
-        if (action === "keyboard") {
-            root.pane = "keyboard";
-            root.nativeLayer = "keyboard";
+        if (action === "layer") {
             root.searchActive = false;
-            Quickshell.execDetached([root.tabletBin, "toolbar", "keyboard"]);
-        } else if (action === "tools") {
-            root.pane = "keyboard";
-            root.nativeLayer = "tools";
-            root.searchActive = false;
-            Quickshell.execDetached([root.tabletBin, "toolbar", "tools"]);
-        } else if (action === "clipboard" || action === "emoji" || action === "history") {
+            if (root.pane !== "keyboard") {
+                root.pane = "keyboard";
+                root.nativeLayer = "keyboard";
+                Quickshell.execDetached([root.tabletBin, "toolbar", "keyboard"]);
+            } else if (root.nativeLayer === "keyboard") {
+                root.nativeLayer = "tools";
+                Quickshell.execDetached([root.tabletBin, "toolbar", "tools"]);
+            } else {
+                root.nativeLayer = "keyboard";
+                Quickshell.execDetached([root.tabletBin, "toolbar", "keyboard"]);
+            }
+        } else if (action === "clipboard" || action === "emoji") {
             root.openPane(action);
+        } else if (action === "history") {
+            // Protocol7 history is a drawer above the real keyboard. Keep the
+            // native alphabet layer and OSK alive instead of covering it.
+            root.nativeLayer = "keyboard";
+            Quickshell.execDetached([root.tabletBin, "toolbar", "keyboard"]);
+            Quickshell.execDetached([root.tabletBin, "osk", "show"]);
+            root.openPane("history");
         } else if (action === "mic") {
             if (root.actionBin !== "")
                 Quickshell.execDetached([root.actionBin, "protocol7"]);
@@ -207,6 +221,24 @@ ShellRoot {
         interval: 180
         repeat: false
         onTriggered: Quickshell.execDetached([root.tabletBin, "osk", "show"])
+    }
+
+    Timer {
+        id: historyInsertDelay
+        interval: 100
+        repeat: false
+        onTriggered: {
+            if (root.actionBin !== "" && root.pendingHistoryId !== "") {
+                Quickshell.execDetached([
+                    root.actionBin,
+                    "dictation-insert",
+                    root.pendingHistoryId,
+                    root.pendingHistoryTimestamp
+                ]);
+            }
+            root.pendingHistoryId = "";
+            root.pendingHistoryTimestamp = "";
+        }
     }
 
     Process {
@@ -338,7 +370,7 @@ ShellRoot {
 
     PanelWindow {
         id: auxiliaryPane
-        visible: root.toolbarVisible && root.pane !== "keyboard"
+        visible: root.toolbarVisible && (root.pane === "clipboard" || root.pane === "emoji")
         screen: win.screen
         WlrLayershell.layer: WlrLayer.Overlay
         WlrLayershell.namespace: "yoga-osk-auxiliary"
@@ -780,6 +812,198 @@ ShellRoot {
         }
     }
 
+
+
+    // Protocol7 history deliberately lives above the OSK instead of replacing
+    // its key area. This keeps the full native keyboard usable while browsing
+    // or filtering prior dictations.
+    PanelWindow {
+        id: historyDrawer
+        visible: root.toolbarVisible && root.pane === "history"
+        screen: win.screen
+        WlrLayershell.layer: WlrLayer.Overlay
+        WlrLayershell.namespace: "yoga-osk-protocol7-history"
+        WlrLayershell.keyboardFocus: root.searchActive
+            ? WlrKeyboardFocus.Exclusive
+            : WlrKeyboardFocus.None
+        anchors.left: true
+        anchors.right: true
+        anchors.bottom: true
+        margins.left: root.leftMargin
+        margins.bottom: root.bottomMargin
+        implicitHeight: win.screen !== null
+            ? Math.min(300, Math.max(210, win.screen.height * 0.28))
+            : 250
+        exclusionMode: ExclusionMode.Ignore
+        color: root.toolbarSurface
+
+        Rectangle {
+            id: historySearchBox
+            anchors.left: parent.left
+            anchors.right: parent.right
+            anchors.top: parent.top
+            anchors.leftMargin: 12
+            anchors.rightMargin: 12
+            anchors.topMargin: 10
+            height: 40
+            radius: 20
+            color: root.toolbarKey
+
+            Text {
+                anchors.left: parent.left
+                anchors.leftMargin: 13
+                anchors.verticalCenter: parent.verticalCenter
+                text: "search"
+                color: root.toolbarMuted
+                font.family: "Material Symbols Rounded"
+                font.pixelSize: 19
+            }
+
+            TextInput {
+                id: historySearchInput
+                anchors.left: parent.left
+                anchors.right: historySearchClear.left
+                anchors.leftMargin: 42
+                anchors.rightMargin: 8
+                anchors.verticalCenter: parent.verticalCenter
+                text: root.paneQuery
+                color: root.toolbarText
+                font.pixelSize: 14
+                clip: true
+                selectByMouse: false
+                focus: root.searchActive
+
+                onTextEdited: root.paneQuery = text
+
+                Keys.onReturnPressed: event => {
+                    root.searchActive = false;
+                    focus = false;
+                    event.accepted = true;
+                }
+                Keys.onEscapePressed: event => {
+                    root.searchActive = false;
+                    focus = false;
+                    event.accepted = true;
+                }
+
+                Text {
+                    visible: historySearchInput.text.length === 0
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: "Search Protocol 7 history"
+                    color: root.toolbarMuted
+                    font.pixelSize: 14
+                }
+
+                MouseArea {
+                    anchors.fill: parent
+                    onClicked: {
+                        root.searchActive = true;
+                        Qt.callLater(() => historySearchInput.forceActiveFocus());
+                    }
+                }
+            }
+
+            Item {
+                id: historySearchClear
+                anchors.right: parent.right
+                anchors.verticalCenter: parent.verticalCenter
+                anchors.rightMargin: 7
+                width: 32
+                height: 32
+
+                Text {
+                    anchors.centerIn: parent
+                    text: root.paneQuery.length ? "close" : "search"
+                    color: root.toolbarMuted
+                    font.family: "Material Symbols Rounded"
+                    font.pixelSize: 18
+                }
+
+                MouseArea {
+                    anchors.fill: parent
+                    onClicked: {
+                        if (root.paneQuery.length) {
+                            root.paneQuery = "";
+                        } else {
+                            root.searchActive = true;
+                            Qt.callLater(() => historySearchInput.forceActiveFocus());
+                        }
+                    }
+                }
+            }
+        }
+
+        Text {
+            visible: root.historyItems.length === 0 && !historyList.running
+            anchors.centerIn: parent
+            anchors.verticalCenterOffset: 22
+            text: "No dictation history matches"
+            color: root.toolbarMuted
+            font.pixelSize: 14
+        }
+
+        ListView {
+            anchors.left: parent.left
+            anchors.right: parent.right
+            anchors.top: historySearchBox.bottom
+            anchors.bottom: parent.bottom
+            anchors.leftMargin: 10
+            anchors.rightMargin: 10
+            anchors.topMargin: 8
+            anchors.bottomMargin: 10
+            spacing: 7
+            clip: true
+            model: root.historyItems
+
+            delegate: Rectangle {
+                required property var modelData
+                width: ListView.view.width
+                height: Math.max(66, drawerHistoryText.implicitHeight + 32)
+                radius: 12
+                color: drawerHistoryArea.pressed ? root.toolbarKey : Qt.rgba(1, 1, 1, 0.035)
+
+                Text {
+                    anchors.left: parent.left
+                    anchors.right: parent.right
+                    anchors.top: parent.top
+                    anchors.leftMargin: 12
+                    anchors.rightMargin: 12
+                    anchors.topMargin: 7
+                    text: new Date(modelData.timestamp * 1000).toLocaleString(Qt.locale(), Locale.ShortFormat)
+                    color: root.toolbarMuted
+                    font.pixelSize: 11
+                }
+
+                Text {
+                    id: drawerHistoryText
+                    anchors.left: parent.left
+                    anchors.right: parent.right
+                    anchors.bottom: parent.bottom
+                    anchors.leftMargin: 12
+                    anchors.rightMargin: 12
+                    anchors.bottomMargin: 8
+                    text: modelData.text
+                    wrapMode: Text.Wrap
+                    maximumLineCount: 3
+                    elide: Text.ElideRight
+                    color: root.toolbarText
+                    font.pixelSize: 13
+                }
+
+                MouseArea {
+                    id: drawerHistoryArea
+                    anchors.fill: parent
+                    onClicked: {
+                        root.searchActive = false;
+                        historySearchInput.focus = false;
+                        root.pendingHistoryId = String(modelData.id);
+                        root.pendingHistoryTimestamp = String(modelData.timestamp);
+                        historyInsertDelay.restart();
+                    }
+                }
+            }
+        }
+    }
 
     PanelWindow {
         id: win

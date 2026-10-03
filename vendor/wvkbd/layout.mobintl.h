@@ -226,14 +226,13 @@ static struct key keys_full[] = {
   {"⌫", "⌫", 1.5, Code, KEY_BACKSPACE, .scheme = 1},
   {"", "", 0.0, EndRow},
 
-  {"Tools", "Tools", 1.25, NextLayer, .scheme = 1},
   {"Esc", "Esc", 1.0, Code, KEY_ESC, .scheme = 1},
   {"Ctrl", "Ctrl", 1.15, Mod, Ctrl, .scheme = 1},
   {"Alt", "Alt", 1.0, Mod, Alt, .scheme = 1},
   {"Super", "Super", 1.15, Mod, Super, .scheme = 1},
   {"Tab", "Tab", 1.0, Code, KEY_TAB, .scheme = 1},
   {",", "'", 1.0, Code, KEY_COMMA, &layouts[ComposeMath]},
-  {"", "Tab", 3.0, Code, KEY_SPACE},
+  {"", "Tab", 4.25, Code, KEY_SPACE},
   {".", "?", 1.0, Code, KEY_DOT, &layouts[ComposePunctuation]},
   {"Enter", "Enter", 1.5, Code, KEY_ENTER, .scheme = 1},
 
@@ -357,7 +356,6 @@ static struct key keys_special[] = {
   {"→", "→", 1.0, Code, KEY_RIGHT, .scheme = 1},
   {"", "", 0.0, EndRow},
 
-  {"Keyboard", "Keyboard", 1.4, BackLayer, .scheme = 1},
   {"Ctrl", "Ctrl", 1.0, Mod, Ctrl, .scheme = 1},
   {"Alt", "Alt", 1.0, Mod, Alt, .scheme = 1},
   {"Super", "Super", 1.1, Mod, Super, .scheme = 1},
@@ -366,7 +364,7 @@ static struct key keys_special[] = {
   {"[", "{", 1.0, Code, KEY_LEFTBRACE},
   {"]", "}", 1.0, Code, KEY_RIGHTBRACE},
   {"⌫", "⌫", 1.2, Code, KEY_BACKSPACE, .scheme = 1},
-  {"Enter", "Enter", 1.4, Code, KEY_ENTER, .scheme = 1},
+  {"Enter", "Enter", 2.8, Code, KEY_ENTER, .scheme = 1},
 
   /* end of layout */
   {"", "", 0.0, Last},
@@ -1137,14 +1135,13 @@ static struct key keys_landscape[] = {
   {"⌫", "⌫", 1.5, Code, KEY_BACKSPACE, .scheme = 1},
   {"", "", 0.0, EndRow},
 
-  {"Tools", "Tools", 1.2, NextLayer, .scheme = 1},
   {"Esc", "Esc", 0.9, Code, KEY_ESC, .scheme = 1},
   {"Ctrl", "Ctrl", 1.0, Mod, Ctrl, .scheme = 1},
   {"Alt", "Alt", 0.9, Mod, Alt, .scheme = 1},
   {"Super", "Super", 1.05, Mod, Super, .scheme = 1},
   {"Tab", "Tab", 0.9, Code, KEY_TAB, .scheme = 1},
   {",", "'", 1.0, Code, KEY_COMMA, &layouts[ComposeMath]},
-  {"", "Tab", 3.6, Code, KEY_SPACE},
+  {"", "Tab", 4.8, Code, KEY_SPACE},
   {".", "?", 1.0, Code, KEY_DOT, &layouts[ComposePunctuation]},
   {"Enter", "Enter", 1.5, Code, KEY_ENTER, .scheme = 1},
 
@@ -1181,12 +1178,11 @@ static struct key keys_landscape_special[] = {
   {"↓", "↓", 1.0, Code, KEY_DOWN}, {"→", "→", 1.0, Code, KEY_RIGHT},
   {"", "", 0.0, EndRow},
 
-  {"Keyboard", "Keyboard", 1.5, BackLayer, .scheme = 1},
   {"Ctrl", "Ctrl", 1.0, Mod, Ctrl}, {"Alt", "Alt", 1.0, Mod, Alt},
   {"Super", "Super", 1.1, Mod, Super}, {"Tab", "Tab", 1.0, Code, KEY_TAB},
   {"`", "~", 1.0, Code, KEY_GRAVE}, {"[", "{", 1.0, Code, KEY_LEFTBRACE},
   {"]", "}", 1.0, Code, KEY_RIGHTBRACE}, {"⌫", "⌫", 1.3, Code, KEY_BACKSPACE},
-  {"Enter", "Enter", 1.5, Code, KEY_ENTER},
+  {"Enter", "Enter", 3.0, Code, KEY_ENTER},
 
   /* end of layout */
   {"", "", 0.0, Last},
