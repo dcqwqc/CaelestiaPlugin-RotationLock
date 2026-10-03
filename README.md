@@ -53,7 +53,12 @@ above the keyboard without delaying their entrance.
 
 The toolbar's reserved native row uses 0.62 of a normal key-row height. The saved
 space is redistributed to the real key rows, keeping the keyboard footprint and
-window-resize inset unchanged while making the icon bar visibly tighter.
+window-resize inset unchanged while making the icon bar visibly tighter. Its
+layer surface stays mapped and transparent at the screen bottom while the OSK is
+closed; opening the OSK raises that resident surface vertically with the keyboard,
+so the toolbar never receives a separate sideways compositor entrance. Toolbar
+grey pills are pointer-hover previews only (mouse/touchpad/stylus); touch taps
+select immediately and the underline alone represents the active mode.
 Clipboard history is searchable and uses `cliphist`;
 dictation history reads Protocol7's existing
 `~/.config/protocol-7/history.json` rather than creating another database. The

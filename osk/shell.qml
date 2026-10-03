@@ -92,7 +92,10 @@ ShellRoot {
     // The first native wvkbd row is intentionally blank and becomes this
     // Gboard-style utility row. The auxiliary panes occupy the rest of the
     // keyboard footprint and fully cover the native keys without stopping them.
-    readonly property bool toolbarVisible: closing && envStr("YOGA_TOOLBAR_ENABLED", "1") === "1"
+    readonly property bool toolbarEnabled: envStr("YOGA_TOOLBAR_ENABLED", "1") === "1"
+    readonly property bool toolbarVisible: closing && toolbarEnabled
+    property bool furnitureReady: false
+    readonly property bool toolbarRaised: toolbarVisible && furnitureReady
     readonly property bool clipboardEnabled: envStr("YOGA_CLIPBOARD_ENABLED", "1") === "1"
     readonly property real oskPadding: envNum("YOGA_OSK_PADDING", 8)
     readonly property int keyboardRows: (win.screen !== null && win.screen.height > win.screen.width) ? 6 : 5
@@ -106,6 +109,14 @@ ShellRoot {
         : 52
     readonly property real toolbarButtonHeight: Math.min(36, Math.max(30, toolbarHeight - 16))
     readonly property real toolbarBottom: Math.max(0, effectiveBottom - toolbarHeight)
+    property real toolbarLift: toolbarRaised ? toolbarBottom : 0
+
+    Behavior on toolbarLift {
+        NumberAnimation {
+            duration: 230
+            easing.type: Easing.OutCubic
+        }
+    }
     readonly property color toolbarSurface: envStr("YOGA_TOOLBAR_SURFACE", "#1b1b1f")
     readonly property color toolbarKey: envStr("YOGA_TOOLBAR_KEY", "#303034")
     readonly property color toolbarText: envStr("YOGA_TOOLBAR_TEXT", "#f4f0f6")
@@ -144,11 +155,15 @@ ShellRoot {
         return buttons;
     }
     Component.onCompleted: {
-        // If this tiny shell process is ever restarted while wvkbd survives a
-        // transient failure, return the native page to its canonical position.
-        Qt.callLater(() => Quickshell.execDetached([
-            root.tabletBin, "pager", "keyboard-reset", "1", "1"
-        ]));
+        // Map the toolbar surface transparent at the bottom first. On the next
+        // frame it may rise with the keyboard, so Hyprland never gets a visible
+        // freshly-mapped toolbar to animate in from the side.
+        Qt.callLater(() => {
+            root.furnitureReady = true;
+            Quickshell.execDetached([
+                root.tabletBin, "pager", "keyboard-reset", "1", "1"
+            ]);
+        });
     }
 
     readonly property var emojiCategories: [
@@ -168,6 +183,14 @@ ShellRoot {
         if (id === "layer")
             return root.pane === "keyboard";
         return root.pane === id;
+    }
+
+    readonly property int toolbarActiveIndex: {
+        for (let i = 0; i < root.toolbarButtons.length; ++i) {
+            if (root.toolbarActive(root.toolbarButtons[i].id))
+                return i;
+        }
+        return 0;
     }
 
     function paneIndex(value: string): int {
@@ -216,6 +239,7 @@ ShellRoot {
         const outgoing = root.pageAFront ? pageA : pageB;
         const incoming = root.pageAFront ? pageB : pageA;
         const travel = Math.max(1, auxiliaryPane.width);
+        const keyboardTravel = Math.max(1, travel + root.leftMargin);
 
         // The native keyboard is a separate layer-shell surface. Move that real
         // surface with the same horizontal curve as the QML pages so keyboard is
@@ -223,12 +247,12 @@ ShellRoot {
         if (root.pane === "keyboard" && nextPane !== "keyboard") {
             Quickshell.execDetached([
                 root.tabletBin, "pager", "keyboard-out-left",
-                String(Math.round(travel)), "230"
+                String(Math.round(keyboardTravel)), "230"
             ]);
         } else if (root.pane !== "keyboard" && nextPane === "keyboard") {
             Quickshell.execDetached([
                 root.tabletBin, "pager", "keyboard-in-left",
-                String(Math.round(travel)), "230"
+                String(Math.round(keyboardTravel)), "230"
             ]);
         }
 
@@ -408,7 +432,10 @@ ShellRoot {
 
     PanelWindow {
         id: toolbar
-        visible: root.toolbarVisible
+        // Keep this surface mapped for the entire tablet session. It rests
+        // transparent at the bottom while the keyboard is closed, then moves
+        // vertically with the OSK instead of receiving Hyprland's layer-in slide.
+        visible: root.toolbarEnabled
         screen: win.screen
         WlrLayershell.layer: WlrLayer.Overlay
         WlrLayershell.namespace: "yoga-osk-toolbar"
@@ -417,19 +444,48 @@ ShellRoot {
         anchors.right: true
         anchors.bottom: true
         margins.left: root.leftMargin
-        margins.bottom: root.toolbarBottom
+        margins.bottom: root.toolbarLift
         implicitHeight: root.toolbarHeight
         exclusionMode: ExclusionMode.Ignore
-        color: root.toolbarSurface
+        color: "transparent"
+        mask: toolbarInputRegion
 
-        Row {
+        Region {
+            id: toolbarInputRegion
+            width: root.toolbarRaised ? toolbar.width : 0
+            height: root.toolbarRaised ? toolbar.height : 0
+        }
+
+        Rectangle {
+            anchors.fill: parent
+            color: root.toolbarSurface
+            opacity: root.toolbarRaised ? 1 : 0
+
+            Behavior on opacity {
+                NumberAnimation { duration: 90 }
+            }
+        }
+
+        Item {
+            id: toolbarDeck
             anchors.centerIn: parent
-            spacing: 5
+            width: toolbarRow.implicitWidth
+            height: root.toolbarButtonHeight
+            opacity: root.toolbarRaised ? 1 : 0
 
-            Repeater {
-                model: root.toolbarButtons
+            Behavior on opacity {
+                NumberAnimation { duration: 90 }
+            }
 
-                delegate: Item {
+            Row {
+                id: toolbarRow
+                anchors.fill: parent
+                spacing: 5
+
+                Repeater {
+                    model: root.toolbarButtons
+
+                    delegate: Item {
                     required property var modelData
                     readonly property bool active: root.toolbarActive(modelData.id)
                     width: 44
@@ -440,10 +496,14 @@ ShellRoot {
                         width: 38
                         height: 30
                         radius: 15
-                        color: parent.active
-                            ? root.toolbarKey
-                            : (iconArea.pressed ? root.toolbarKey : "transparent")
-                        opacity: parent.active ? 1 : (iconArea.pressed ? 0.78 : 1)
+                        // Neutral grey is preview/hover only. Selection itself
+                        // is communicated solely by the underline below.
+                        color: hoverHandler.hovered ? root.toolbarKey : "transparent"
+                        opacity: hoverHandler.hovered ? 1 : 0
+
+                        Behavior on opacity {
+                            NumberAnimation { duration: 90 }
+                        }
 
                         Text {
                             anchors.centerIn: parent
@@ -453,6 +513,13 @@ ShellRoot {
                             font.pixelSize: 21
                         }
 
+                        HoverHandler {
+                            id: hoverHandler
+                            acceptedDevices: PointerDevice.Mouse
+                                | PointerDevice.TouchPad
+                                | PointerDevice.Stylus
+                        }
+
                         MouseArea {
                             id: iconArea
                             anchors.fill: parent
@@ -460,14 +527,25 @@ ShellRoot {
                         }
                     }
 
-                    Rectangle {
-                        visible: parent.active
-                        anchors.horizontalCenter: parent.horizontalCenter
-                        anchors.bottom: parent.bottom
-                        width: 18
-                        height: 3
-                        radius: 2
-                        color: root.toolbarText
+                    }
+                }
+            }
+
+            Rectangle {
+                id: activeIndicator
+                // One physical active indicator: hover can move independently,
+                // then a click updates toolbarActiveIndex and this line catches up.
+                x: root.toolbarActiveIndex * (44 + toolbarRow.spacing) + (44 - width) / 2
+                anchors.bottom: parent.bottom
+                width: 18
+                height: 3
+                radius: 2
+                color: root.toolbarText
+
+                Behavior on x {
+                    NumberAnimation {
+                        duration: 180
+                        easing.type: Easing.OutCubic
                     }
                 }
             }
