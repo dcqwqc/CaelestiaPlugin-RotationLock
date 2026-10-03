@@ -3,6 +3,8 @@
 
 #include <pango/pangocairo.h>
 #include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
 
 struct drw {
 	struct wl_shm *shm;
@@ -53,6 +55,8 @@ void drw_over_rectangle(struct drwsurf *ds, Color color, uint32_t x, uint32_t y,
 void drw_draw_text(struct drwsurf *ds, Color color, uint32_t x, uint32_t y,
                    uint32_t w, uint32_t h, uint32_t b, const char *label,
                    PangoFontDescription *font_description);
+void drw_draw_polyline(struct drwsurf *ds, Color color, const uint16_t *xs,
+                       const uint16_t *ys, size_t count, double width);
 
 uint32_t setup_buffer(struct drwsurf *ds, struct drwbuf *db);
 

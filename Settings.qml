@@ -85,7 +85,7 @@ SettingsObject {
     property bool oskToolbar: true
     SettingMeta on oskToolbar {
         label: "Keyboard utility row"
-        description: "Show Keyboard, Clipboard, Emoji, Tools, Protocol7, and Hide controls inside the keyboard footprint."
+        description: "Show the icon row for keyboard, clipboard, emoji, desktop controls, dictation history, and voice input."
         icon: "toolbar"
         inputType: SettingMeta.Switch
     }
@@ -93,7 +93,7 @@ SettingsObject {
     property bool oskClipboard: true
     SettingMeta on oskClipboard {
         label: "Clipboard keyboard tab"
-        description: "Allow the utility row to show up to eight recent text clips when cliphist and wl-clipboard are installed."
+        description: "Show a full searchable clipboard-history panel when cliphist and wl-clipboard are installed."
         icon: "content_paste"
         inputType: SettingMeta.Switch
     }

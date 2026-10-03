@@ -62,63 +62,207 @@ ShellRoot {
     // the same thing, so this only decides how early it fires.
     readonly property real dragThreshold: envNum("YOGA_HANDLE_THRESHOLD", 18)
 
-    // The toolbar is drawn over a deliberately blank native wvkbd row.  It is
-    // therefore inside wvkbd's exclusive zone rather than being another
-    // overlay that covers applications above the keyboard.
+    // The first native wvkbd row is intentionally blank and becomes this
+    // Gboard-style utility row. The auxiliary panes occupy the rest of the
+    // keyboard footprint and fully cover the native keys without stopping them.
     readonly property bool toolbarVisible: closing && envStr("YOGA_TOOLBAR_ENABLED", "1") === "1"
     readonly property bool clipboardEnabled: envStr("YOGA_CLIPBOARD_ENABLED", "1") === "1"
     readonly property real oskPadding: envNum("YOGA_OSK_PADDING", 8)
     readonly property int keyboardRows: (win.screen !== null && win.screen.height > win.screen.width) ? 6 : 5
-    // wvkbd divides the usable height evenly across its rows. Fill the complete
-    // reserved first row with the toolbar surface so there is no dead strip,
-    // while keeping the controls themselves Gboard-compact in the centre.
     readonly property real toolbarHeight: closing && bottomMargin > 0
         ? Math.max(42, (bottomMargin - oskPadding * 2) / keyboardRows)
         : 42
-    readonly property real toolbarButtonHeight: Math.min(44, Math.max(34, toolbarHeight - 12))
+    readonly property real toolbarButtonHeight: Math.min(42, Math.max(34, toolbarHeight - 14))
     readonly property real toolbarBottom: Math.max(0, bottomMargin - toolbarHeight)
-    readonly property color toolbarSurface: envStr("YOGA_TOOLBAR_SURFACE", "#24232a")
-    readonly property color toolbarKey: envStr("YOGA_TOOLBAR_KEY", "#34323b")
-    readonly property color toolbarText: envStr("YOGA_TOOLBAR_TEXT", "#f0edf5")
+    readonly property color toolbarSurface: envStr("YOGA_TOOLBAR_SURFACE", "#1b1b1f")
+    readonly property color toolbarKey: envStr("YOGA_TOOLBAR_KEY", "#303034")
+    readonly property color toolbarText: envStr("YOGA_TOOLBAR_TEXT", "#f4f0f6")
+    readonly property color toolbarMuted: envStr("YOGA_TOOLBAR_MUTED", "#c9c5ca")
+
     property string pane: "keyboard"
+    property string nativeLayer: "keyboard"
+    property string paneQuery: ""
+    property bool searchActive: false
+    property string emojiCategory: "all"
     property var clipItems: []
     property bool clipboardAvailable: false
+    property var emojiItems: []
+    property var emojiNext: null
+    property var historyItems: []
+
+    readonly property var toolbarButtons: {
+        const buttons = [
+            { id: "keyboard", icon: "keyboard" }
+        ];
+        if (root.clipboardEnabled)
+            buttons.push({ id: "clipboard", icon: "content_paste" });
+        buttons.push(
+            { id: "emoji", icon: "emoji_emotions" },
+            { id: "tools", icon: "keyboard_command_key" },
+            { id: "history", icon: "history" },
+            { id: "mic", icon: "mic" }
+        );
+        return buttons;
+    }
+    readonly property var emojiCategories: [
+        { id: "all", icon: "apps" },
+        { id: "people", icon: "sentiment_satisfied" },
+        { id: "animals", icon: "pets" },
+        { id: "nature", icon: "local_florist" },
+        { id: "food", icon: "restaurant" },
+        { id: "activity", icon: "sports_soccer" },
+        { id: "travel", icon: "flight" },
+        { id: "objects", icon: "lightbulb" },
+        { id: "symbols", icon: "favorite" },
+        { id: "flags", icon: "flag" }
+    ]
+
+    function toolbarActive(id: string): bool {
+        if (id === "keyboard")
+            return root.pane === "keyboard" && root.nativeLayer === "keyboard";
+        if (id === "tools")
+            return root.pane === "keyboard" && root.nativeLayer === "tools";
+        return root.pane === id;
+    }
+
+    function openPane(nextPane: string): void {
+        root.paneQuery = "";
+        root.searchActive = false;
+        root.pane = nextPane;
+        paneRefresh.restart();
+    }
 
     function runToolbar(action: string): void {
-        if (action === "Keyboard") {
+        if (action === "keyboard") {
             root.pane = "keyboard";
+            root.nativeLayer = "keyboard";
+            root.searchActive = false;
             Quickshell.execDetached([root.tabletBin, "toolbar", "keyboard"]);
-        } else if (action === "Clipboard") {
-            root.pane = root.pane === "clipboard" ? "keyboard" : "clipboard";
-            if (root.pane === "clipboard")
-                clipboardList.running = true;
-        } else if (action === "Emoji") {
-            root.pane = root.pane === "emoji" ? "keyboard" : "emoji";
-        } else if (action === "Tools") {
+        } else if (action === "tools") {
             root.pane = "keyboard";
+            root.nativeLayer = "tools";
+            root.searchActive = false;
             Quickshell.execDetached([root.tabletBin, "toolbar", "tools"]);
-        } else if (action === "Protocol7") {
+        } else if (action === "clipboard" || action === "emoji" || action === "history") {
+            root.openPane(action);
+        } else if (action === "mic") {
             if (root.actionBin !== "")
                 Quickshell.execDetached([root.actionBin, "protocol7"]);
-        } else if (action === "Hide") {
-            root.pane = "keyboard";
-            Quickshell.execDetached([root.tabletBin, "osk", "hide"]);
+            keepKeyboardVisible.restart();
         }
+    }
+
+    function refreshPane(): void {
+        if (root.actionBin === "" || root.pane === "keyboard")
+            return;
+        if (root.pane === "clipboard") {
+            if (!clipboardList.running) {
+                clipboardList.command = [root.actionBin, "clipboard-list", root.paneQuery];
+                clipboardList.running = true;
+            }
+        } else if (root.pane === "emoji") {
+            root.emojiItems = [];
+            root.emojiNext = null;
+            if (!emojiList.running) {
+                emojiList.command = [root.actionBin, "emoji-list", root.emojiCategory, root.paneQuery, "0"];
+                emojiList.running = true;
+            }
+        } else if (root.pane === "history") {
+            if (!historyList.running) {
+                historyList.command = [root.actionBin, "dictation-list", root.paneQuery];
+                historyList.running = true;
+            }
+        }
+    }
+
+    function loadMoreEmoji(): void {
+        if (root.pane !== "emoji" || root.actionBin === "" || root.emojiNext === null || emojiList.running)
+            return;
+        emojiList.command = [root.actionBin, "emoji-list", root.emojiCategory, root.paneQuery, String(root.emojiNext)];
+        emojiList.running = true;
+    }
+
+    onPaneQueryChanged: searchDebounce.restart()
+    onEmojiCategoryChanged: {
+        if (root.pane === "emoji")
+            searchDebounce.restart();
+    }
+
+    Timer {
+        id: searchDebounce
+        interval: 130
+        repeat: false
+        onTriggered: root.refreshPane()
+    }
+
+    Timer {
+        id: paneRefresh
+        interval: 10
+        repeat: false
+        onTriggered: root.refreshPane()
+    }
+
+    Timer {
+        id: keepKeyboardVisible
+        interval: 180
+        repeat: false
+        onTriggered: Quickshell.execDetached([root.tabletBin, "osk", "show"])
     }
 
     Process {
         id: clipboardList
-        command: root.actionBin === "" ? [] : [root.actionBin, "clipboard-list"]
         running: false
-        stdout: SplitParser {
-            onRead: data => {
+        stdout: StdioCollector {
+            onStreamFinished: {
                 try {
-                    const result = JSON.parse(data);
+                    const result = JSON.parse(text);
                     root.clipboardAvailable = result.available === true;
                     root.clipItems = Array.isArray(result.items) ? result.items : [];
                 } catch (_) {
                     root.clipboardAvailable = false;
                     root.clipItems = [];
+                }
+            }
+        }
+    }
+
+    Process {
+        id: emojiList
+        running: false
+        property int requestedOffset: {
+            const value = command.length >= 5 ? parseInt(command[4]) : 0;
+            return isNaN(value) ? 0 : value;
+        }
+        stdout: StdioCollector {
+            onStreamFinished: {
+                try {
+                    const result = JSON.parse(text);
+                    const page = Array.isArray(result.items) ? result.items : [];
+                    root.emojiItems = emojiList.requestedOffset === 0
+                        ? page
+                        : root.emojiItems.concat(page);
+                    root.emojiNext = result.next === null || result.next === undefined
+                        ? null
+                        : Number(result.next);
+                } catch (_) {
+                    if (emojiList.requestedOffset === 0)
+                        root.emojiItems = [];
+                    root.emojiNext = null;
+                }
+            }
+        }
+    }
+
+    Process {
+        id: historyList
+        running: false
+        stdout: StdioCollector {
+            onStreamFinished: {
+                try {
+                    const result = JSON.parse(text);
+                    root.historyItems = Array.isArray(result.items) ? result.items : [];
+                } catch (_) {
+                    root.historyItems = [];
                 }
             }
         }
@@ -134,6 +278,7 @@ ShellRoot {
         anchors.left: true
         anchors.right: true
         anchors.bottom: true
+        margins.left: root.leftMargin
         margins.bottom: root.toolbarBottom
         implicitHeight: root.toolbarHeight
         exclusionMode: ExclusionMode.Ignore
@@ -141,31 +286,50 @@ ShellRoot {
 
         Row {
             anchors.centerIn: parent
-            spacing: 6
+            spacing: 7
+
             Repeater {
-                model: root.clipboardEnabled
-                       ? ["Keyboard", "Clipboard", "Emoji", "Tools", "Protocol7", "Hide"]
-                       : ["Keyboard", "Emoji", "Tools", "Protocol7", "Hide"]
-                delegate: Rectangle {
-                    required property string modelData
-                    readonly property bool active: (modelData === "Clipboard" && root.pane === "clipboard")
-                                                 || (modelData === "Emoji" && root.pane === "emoji")
-                    width: Math.max(64, label.implicitWidth + 22)
+                model: root.toolbarButtons
+
+                delegate: Item {
+                    required property var modelData
+                    readonly property bool active: root.toolbarActive(modelData.id)
+                    width: 48
                     height: root.toolbarButtonHeight
-                    radius: height / 2
-                    color: active || button.pressed ? root.toolbarText : root.toolbarKey
-                    Text {
-                        id: label
+
+                    Rectangle {
                         anchors.centerIn: parent
-                        text: modelData
-                        color: active || button.pressed ? root.toolbarSurface : root.toolbarText
-                        font.pixelSize: 13
-                        font.family: "Rubik, Noto Color Emoji, sans-serif"
+                        width: 42
+                        height: 34
+                        radius: 17
+                        color: parent.active
+                            ? root.toolbarKey
+                            : (iconArea.pressed ? root.toolbarKey : "transparent")
+                        opacity: parent.active ? 1 : (iconArea.pressed ? 0.78 : 1)
+
+                        Text {
+                            anchors.centerIn: parent
+                            text: modelData.icon
+                            color: root.toolbarText
+                            font.family: "Material Symbols Rounded"
+                            font.pixelSize: 22
+                        }
+
+                        MouseArea {
+                            id: iconArea
+                            anchors.fill: parent
+                            onClicked: root.runToolbar(modelData.id)
+                        }
                     }
-                    MouseArea {
-                        id: button
-                        anchors.fill: parent
-                        onClicked: root.runToolbar(modelData)
+
+                    Rectangle {
+                        visible: parent.active
+                        anchors.horizontalCenter: parent.horizontalCenter
+                        anchors.bottom: parent.bottom
+                        width: 18
+                        height: 3
+                        radius: 2
+                        color: root.toolbarText
                     }
                 }
             }
@@ -182,58 +346,321 @@ ShellRoot {
         anchors.left: true
         anchors.right: true
         anchors.bottom: true
-        margins.bottom: Math.max(0, root.toolbarBottom - implicitHeight)
-        implicitHeight: 148
+        margins.left: root.leftMargin
+        margins.bottom: 0
+        implicitHeight: root.toolbarBottom
         exclusionMode: ExclusionMode.Ignore
         color: root.toolbarSurface
 
-        Item {
-            anchors.fill: parent
-            visible: root.pane === "clipboard"
+        readonly property real headerHeight: root.pane === "emoji" ? 94 : 54
+        readonly property real searchPadHeight: root.searchActive ? Math.max(150, height * 0.44) : 0
+
+        Rectangle {
+            id: searchBox
+            anchors.left: parent.left
+            anchors.right: parent.right
+            anchors.top: parent.top
+            anchors.leftMargin: 12
+            anchors.rightMargin: 12
+            anchors.topMargin: 8
+            height: 38
+            radius: 19
+            color: root.toolbarKey
+
             Text {
                 anchors.left: parent.left
-                anchors.leftMargin: 18
-                anchors.top: parent.top
-                anchors.topMargin: 8
-                text: root.clipboardAvailable ? "Clipboard history" : "Clipboard history is unavailable"
-                color: root.toolbarText
-                font.pixelSize: 13
+                anchors.leftMargin: 13
+                anchors.verticalCenter: parent.verticalCenter
+                text: "search"
+                color: root.toolbarMuted
+                font.family: "Material Symbols Rounded"
+                font.pixelSize: 19
             }
-            ListView {
+
+            TextInput {
+                id: searchInput
                 anchors.left: parent.left
-                anchors.right: parent.right
-                anchors.top: parent.top
-                anchors.bottom: parent.bottom
-                anchors.margins: 8
-                anchors.topMargin: 30
-                orientation: ListView.Horizontal
-                spacing: 8
+                anchors.right: clearSearch.left
+                anchors.leftMargin: 42
+                anchors.rightMargin: 8
+                anchors.verticalCenter: parent.verticalCenter
+                text: root.paneQuery
+                readOnly: true
+                color: root.toolbarText
+                font.pixelSize: 14
                 clip: true
-                model: root.clipItems
-                delegate: Rectangle {
-                    required property var modelData
-                    width: Math.min(220, Math.max(112, preview.implicitWidth + 24))
-                    height: parent.height
-                    radius: 10
-                    color: pasteArea.pressed ? root.toolbarText : root.toolbarKey
-                    Text {
-                        id: preview
-                        anchors.fill: parent
-                        anchors.margins: 9
-                        text: modelData.preview
-                        elide: Text.ElideRight
-                        wrapMode: Text.Wrap
-                        maximumLineCount: 3
-                        color: pasteArea.pressed ? root.toolbarSurface : root.toolbarText
-                        font.pixelSize: 13
+                selectByMouse: false
+
+                Text {
+                    visible: root.paneQuery.length === 0
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: root.pane === "emoji"
+                        ? "Search emojis"
+                        : root.pane === "history" ? "Search dictation history" : "Search clipboard"
+                    color: root.toolbarMuted
+                    font.pixelSize: 14
+                }
+
+                MouseArea {
+                    anchors.fill: parent
+                    onClicked: root.searchActive = true
+                }
+            }
+
+            Item {
+                id: clearSearch
+                anchors.right: parent.right
+                anchors.verticalCenter: parent.verticalCenter
+                anchors.rightMargin: 7
+                width: 32
+                height: 32
+
+                Text {
+                    anchors.centerIn: parent
+                    text: root.paneQuery.length ? "close" : "search"
+                    color: root.toolbarMuted
+                    font.family: "Material Symbols Rounded"
+                    font.pixelSize: 18
+                }
+
+                MouseArea {
+                    anchors.fill: parent
+                    onClicked: {
+                        if (root.paneQuery.length)
+                            root.paneQuery = "";
+                        else
+                            root.searchActive = true;
                     }
-                    MouseArea {
-                        id: pasteArea
-                        anchors.fill: parent
-                        onClicked: {
-                            if (root.actionBin !== "")
-                                Quickshell.execDetached([root.actionBin, "clipboard-paste", modelData.id]);
-                            root.pane = "keyboard";
+                }
+            }
+        }
+
+        ListView {
+            id: emojiCategoryBar
+            visible: root.pane === "emoji"
+            anchors.left: parent.left
+            anchors.right: parent.right
+            anchors.top: searchBox.bottom
+            anchors.topMargin: 4
+            height: 42
+            orientation: ListView.Horizontal
+            spacing: 4
+            clip: true
+            leftMargin: 10
+            rightMargin: 10
+            model: root.emojiCategories
+
+            delegate: Rectangle {
+                required property var modelData
+                width: 42
+                height: 34
+                radius: 17
+                color: root.emojiCategory === modelData.id ? root.toolbarKey : "transparent"
+
+                Text {
+                    anchors.centerIn: parent
+                    text: modelData.icon
+                    color: root.toolbarText
+                    font.family: "Material Symbols Rounded"
+                    font.pixelSize: 19
+                }
+
+                MouseArea {
+                    anchors.fill: parent
+                    onClicked: {
+                        root.emojiCategory = modelData.id;
+                        root.emojiItems = [];
+                        root.emojiNext = null;
+                    }
+                }
+            }
+        }
+
+        Item {
+            id: resultsArea
+            anchors.left: parent.left
+            anchors.right: parent.right
+            anchors.top: parent.top
+            anchors.topMargin: auxiliaryPane.headerHeight
+            anchors.bottom: searchPad.top
+            clip: true
+
+            Item {
+                anchors.fill: parent
+                visible: root.pane === "clipboard"
+
+                Text {
+                    visible: !root.clipboardAvailable || root.clipItems.length === 0
+                    anchors.centerIn: parent
+                    text: root.clipboardAvailable ? "No clipboard matches" : "Clipboard history unavailable"
+                    color: root.toolbarMuted
+                    font.pixelSize: 14
+                }
+
+                ListView {
+                    anchors.fill: parent
+                    anchors.leftMargin: 10
+                    anchors.rightMargin: 10
+                    anchors.bottomMargin: 8
+                    spacing: 7
+                    clip: true
+                    model: root.clipItems
+
+                    delegate: Rectangle {
+                        required property var modelData
+                        width: ListView.view.width
+                        height: Math.max(56, clipPreview.implicitHeight + 20)
+                        radius: 12
+                        color: clipArea.pressed ? root.toolbarKey : Qt.rgba(1, 1, 1, 0.035)
+
+                        Text {
+                            id: clipPreview
+                            anchors.left: parent.left
+                            anchors.right: parent.right
+                            anchors.verticalCenter: parent.verticalCenter
+                            anchors.margins: 12
+                            text: modelData.preview
+                            wrapMode: Text.Wrap
+                            maximumLineCount: 3
+                            elide: Text.ElideRight
+                            color: root.toolbarText
+                            font.pixelSize: 13
+                        }
+
+                        MouseArea {
+                            id: clipArea
+                            anchors.fill: parent
+                            onClicked: {
+                                if (root.actionBin !== "")
+                                    Quickshell.execDetached([root.actionBin, "clipboard-paste", modelData.id]);
+                            }
+                        }
+                    }
+                }
+            }
+
+            Item {
+                anchors.fill: parent
+                visible: root.pane === "emoji"
+
+                Text {
+                    visible: root.emojiItems.length === 0 && !emojiList.running
+                    anchors.centerIn: parent
+                    text: "No emoji matches"
+                    color: root.toolbarMuted
+                    font.pixelSize: 14
+                }
+
+                GridView {
+                    id: emojiGrid
+                    anchors.fill: parent
+                    anchors.leftMargin: 8
+                    anchors.rightMargin: 8
+                    anchors.bottomMargin: 8
+                    clip: true
+                    cellWidth: 50
+                    cellHeight: 50
+                    model: root.emojiItems
+
+                    onContentYChanged: {
+                        if (contentY + height >= contentHeight - 140)
+                            root.loadMoreEmoji();
+                    }
+
+                    delegate: Rectangle {
+                        required property var modelData
+                        width: 44
+                        height: 44
+                        radius: 11
+                        color: emojiArea.pressed ? root.toolbarKey : "transparent"
+
+                        Text {
+                            anchors.centerIn: parent
+                            text: modelData.emoji
+                            font.pixelSize: 25
+                            font.family: "Noto Color Emoji"
+                        }
+
+                        MouseArea {
+                            id: emojiArea
+                            anchors.fill: parent
+                            onClicked: {
+                                if (root.actionBin !== "")
+                                    Quickshell.execDetached([root.actionBin, "emoji", modelData.emoji]);
+                            }
+                        }
+                    }
+                }
+            }
+
+            Item {
+                anchors.fill: parent
+                visible: root.pane === "history"
+
+                Text {
+                    visible: root.historyItems.length === 0 && !historyList.running
+                    anchors.centerIn: parent
+                    text: "No dictation history matches"
+                    color: root.toolbarMuted
+                    font.pixelSize: 14
+                }
+
+                ListView {
+                    anchors.fill: parent
+                    anchors.leftMargin: 10
+                    anchors.rightMargin: 10
+                    anchors.bottomMargin: 8
+                    spacing: 7
+                    clip: true
+                    model: root.historyItems
+
+                    delegate: Rectangle {
+                        required property var modelData
+                        width: ListView.view.width
+                        height: Math.max(70, historyText.implicitHeight + 34)
+                        radius: 12
+                        color: historyArea.pressed ? root.toolbarKey : Qt.rgba(1, 1, 1, 0.035)
+
+                        Text {
+                            anchors.left: parent.left
+                            anchors.right: parent.right
+                            anchors.top: parent.top
+                            anchors.leftMargin: 12
+                            anchors.rightMargin: 12
+                            anchors.topMargin: 8
+                            text: new Date(modelData.timestamp * 1000).toLocaleString(Qt.locale(), Locale.ShortFormat)
+                            color: root.toolbarMuted
+                            font.pixelSize: 11
+                        }
+
+                        Text {
+                            id: historyText
+                            anchors.left: parent.left
+                            anchors.right: parent.right
+                            anchors.bottom: parent.bottom
+                            anchors.leftMargin: 12
+                            anchors.rightMargin: 12
+                            anchors.bottomMargin: 9
+                            text: modelData.text
+                            wrapMode: Text.Wrap
+                            maximumLineCount: 4
+                            elide: Text.ElideRight
+                            color: root.toolbarText
+                            font.pixelSize: 13
+                        }
+
+                        MouseArea {
+                            id: historyArea
+                            anchors.fill: parent
+                            onClicked: {
+                                if (root.actionBin !== "")
+                                    Quickshell.execDetached([
+                                        root.actionBin,
+                                        "dictation-insert",
+                                        String(modelData.id),
+                                        String(modelData.timestamp)
+                                    ]);
+                            }
                         }
                     }
                 }
@@ -241,33 +668,110 @@ ShellRoot {
         }
 
         Item {
-            anchors.fill: parent
-            visible: root.pane === "emoji"
-            Grid {
-                anchors.centerIn: parent
-                columns: 12
-                spacing: 6
+            id: searchPad
+            anchors.left: parent.left
+            anchors.right: parent.right
+            anchors.bottom: parent.bottom
+            height: auxiliaryPane.searchPadHeight
+            visible: root.searchActive
+            clip: true
+
+            Rectangle {
+                anchors.fill: parent
+                color: root.toolbarSurface
+            }
+
+            Column {
+                anchors.fill: parent
+                anchors.leftMargin: 10
+                anchors.rightMargin: 10
+                anchors.topMargin: 7
+                anchors.bottomMargin: 7
+                spacing: 5
+
                 Repeater {
-                    model: ["😀", "😂", "😍", "🥳", "👍", "👎", "🙏", "❤️", "🔥", "🎉", "✅", "❌",
-                            "🤔", "👏", "🚀", "💡", "📌", "📎", "✅", "⚠️", "✨", "🌍", "☕", "💻"]
-                    delegate: Rectangle {
+                    model: ["qwertyuiop", "asdfghjkl", "zxcvbnm"]
+
+                    delegate: Row {
                         required property string modelData
-                        width: 38
-                        height: 38
-                        radius: 9
-                        color: emojiArea.pressed ? root.toolbarText : root.toolbarKey
-                        Text {
-                            anchors.centerIn: parent
-                            text: modelData
-                            font.pixelSize: 21
-                            font.family: "Noto Color Emoji, Twemoji Mozilla, sans-serif"
+                        width: parent.width
+                        height: (searchPad.height - 43 - 29) / 3
+                        spacing: 4
+                        anchors.horizontalCenter: parent.horizontalCenter
+
+                        Repeater {
+                            model: modelData.length
+
+                            delegate: Rectangle {
+                                required property int index
+                                width: (parent.width - (modelData.length - 1) * parent.spacing) / modelData.length
+                                height: parent.height
+                                radius: 8
+                                color: letterArea.pressed ? root.toolbarText : root.toolbarKey
+
+                                Text {
+                                    anchors.centerIn: parent
+                                    text: modelData.charAt(index)
+                                    color: letterArea.pressed ? root.toolbarSurface : root.toolbarText
+                                    font.pixelSize: 15
+                                }
+
+                                MouseArea {
+                                    id: letterArea
+                                    anchors.fill: parent
+                                    onClicked: {
+                                        if (root.paneQuery.length < 96)
+                                            root.paneQuery += modelData.charAt(index);
+                                    }
+                                }
+                            }
                         }
-                        MouseArea {
-                            id: emojiArea
-                            anchors.fill: parent
-                            onClicked: {
-                                if (root.actionBin !== "")
-                                    Quickshell.execDetached([root.actionBin, "emoji", modelData]);
+                    }
+                }
+
+                Row {
+                    width: parent.width
+                    height: 38
+                    spacing: 5
+
+                    Repeater {
+                        model: [
+                            { id: "clear", label: "Clear", weight: 1.0 },
+                            { id: "space", label: "Space", weight: 2.2 },
+                            { id: "backspace", label: "⌫", weight: 1.0 },
+                            { id: "done", label: "Done", weight: 1.0 }
+                        ]
+
+                        delegate: Rectangle {
+                            required property var modelData
+                            readonly property real unitWidth: (parent.width - parent.spacing * 3) / 5.2
+                            width: unitWidth * modelData.weight
+                            height: parent.height
+                            radius: 9
+                            color: actionArea.pressed ? root.toolbarText : root.toolbarKey
+
+                            Text {
+                                anchors.centerIn: parent
+                                text: modelData.label
+                                color: actionArea.pressed ? root.toolbarSurface : root.toolbarText
+                                font.pixelSize: 13
+                            }
+
+                            MouseArea {
+                                id: actionArea
+                                anchors.fill: parent
+                                onClicked: {
+                                    if (modelData.id === "clear") {
+                                        root.paneQuery = "";
+                                    } else if (modelData.id === "space") {
+                                        if (root.paneQuery.length < 96)
+                                            root.paneQuery += " ";
+                                    } else if (modelData.id === "backspace") {
+                                        root.paneQuery = root.paneQuery.slice(0, -1);
+                                    } else if (modelData.id === "done") {
+                                        root.searchActive = false;
+                                    }
+                                }
                             }
                         }
                     }
@@ -275,6 +779,7 @@ ShellRoot {
             }
         }
     }
+
 
     PanelWindow {
         id: win

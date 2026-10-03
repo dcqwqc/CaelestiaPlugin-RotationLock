@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-"""Small, argv-only actions used by the TabletMode keyboard toolbar.
+"""Private, argv-only data/actions for the TabletMode OSK panes.
 
-Clipboard data is intentionally never written to a log or evaluated as code.
-The only stdout carrying clipboard text is the private JSON response consumed
-by the toolbar process itself.
+Content from cliphist, Protocol7 history, and search fields is never logged or
+evaluated. JSON responses are consumed only by the local Quickshell pane.
 """
 
 from __future__ import annotations
@@ -16,49 +15,62 @@ import sys
 import time
 from pathlib import Path
 
-MAX_CLIPS = 8
-MAX_PREVIEW = 180
+MAX_CLIPS = 100
+MAX_PREVIEW = 600
+MAX_QUERY = 96
+EMOJI_PAGE = 96
+EMOJI_FILE = Path("/usr/share/noctalia/assets/emoji.json")
+HISTORY_FILE = Path.home() / ".config" / "protocol-7" / "history.json"
+HISTORY_LIMIT = 100
+MAX_HISTORY_TEXT = 6000
+EMOJI_CATEGORIES = ("all", "people", "nature", "food", "activity", "travel", "objects", "symbols", "flags", "animals")
 
 
-def available() -> bool:
+def emit(value: dict) -> int:
+    print(json.dumps(value, ensure_ascii=False, separators=(",", ":")))
+    return 0
+
+
+def query(value: str) -> str | None:
+    if len(value) > MAX_QUERY or any(ord(char) < 0x20 for char in value):
+        return None
+    return " ".join(value.casefold().split())
+
+
+def clipboard_available() -> bool:
     return all(shutil.which(binary) for binary in ("cliphist", "wl-copy", "wl-paste", "wtype"))
 
 
-def clipboard_list() -> int:
-    if not available():
-        print(json.dumps({"available": False, "items": []}))
-        return 0
+def clipboard_list(filter_text: str) -> int:
+    needle = query(filter_text)
+    if needle is None or not clipboard_available():
+        return emit({"available": False, "items": []})
     try:
         result = subprocess.run(["cliphist", "list"], check=False, timeout=2,
                                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                                 text=True, encoding="utf-8", errors="replace")
     except (OSError, subprocess.SubprocessError):
-        print(json.dumps({"available": False, "items": []}))
-        return 0
+        return emit({"available": False, "items": []})
     items = []
     for line in result.stdout.splitlines():
         match = re.match(r"^(\d+)\s+(.*)$", line, re.DOTALL)
         if not match:
             continue
-        # A bounded display preview only. The id is validated again before
-        # decoding, and clipboard text never becomes an argument or command.
         preview = " ".join(match.group(2).split())[:MAX_PREVIEW]
-        if preview.startswith("[[ binary data"):
+        if preview.startswith("[[ binary data") or (needle and needle not in preview.casefold()):
             continue
         items.append({"id": match.group(1), "preview": preview})
         if len(items) == MAX_CLIPS:
             break
-    print(json.dumps({"available": True, "items": items}, ensure_ascii=False))
-    return 0
+    return emit({"available": True, "items": items})
 
 
 def clipboard_paste(clip_id: str) -> int:
-    if not available() or not re.fullmatch(r"\d+", clip_id):
+    if not clipboard_available() or not re.fullmatch(r"\d+", clip_id):
         return 1
     try:
-        decoded = subprocess.run(["cliphist", "decode", clip_id], check=False,
-                                 timeout=2, stdout=subprocess.PIPE,
-                                 stderr=subprocess.DEVNULL)
+        decoded = subprocess.run(["cliphist", "decode", clip_id], check=False, timeout=2,
+                                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         if decoded.returncode != 0:
             return 1
         copied = subprocess.run(["wl-copy", "--type", "text/plain;charset=utf-8"],
@@ -74,9 +86,51 @@ def clipboard_paste(clip_id: str) -> int:
         return 1
 
 
+def emoji_records() -> list[dict]:
+    """Read a known data-only file and retain a bounded, typed projection."""
+    try:
+        if not EMOJI_FILE.is_file() or EMOJI_FILE.stat().st_size > 4_000_000:
+            return []
+        data = json.loads(EMOJI_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    if not isinstance(data, list):
+        return []
+    records = []
+    for item in data[:2500]:
+        if not isinstance(item, dict):
+            continue
+        glyph, name, keywords, category = (item.get("emoji"), item.get("name"),
+                                           item.get("keywords"), item.get("category"))
+        if (not isinstance(glyph, str) or not 1 <= len(glyph) <= 24 or
+                not isinstance(name, str) or not isinstance(keywords, list) or
+                not isinstance(category, str) or category not in EMOJI_CATEGORIES):
+            continue
+        words = [word for word in keywords[:24] if isinstance(word, str) and len(word) <= 80]
+        records.append({"emoji": glyph, "name": name[:160], "keywords": words, "category": category})
+    return records
+
+
+def emoji_list(category: str, filter_text: str, offset_text: str) -> int:
+    needle = query(filter_text)
+    if category not in EMOJI_CATEGORIES or needle is None or not re.fullmatch(r"\d{1,5}", offset_text):
+        return emit({"items": [], "total": 0, "next": None})
+    offset = int(offset_text)
+    records = emoji_records()
+    matches = []
+    for item in records:
+        haystack = " ".join([item["name"], *item["keywords"]]).casefold()
+        if (category == "all" or item["category"] == category) and (not needle or needle in haystack):
+            matches.append({"emoji": item["emoji"], "name": item["name"], "category": item["category"]})
+    page = matches[offset:offset + EMOJI_PAGE]
+    next_offset = offset + len(page)
+    return emit({"items": page, "total": len(matches),
+                 "next": next_offset if next_offset < len(matches) else None})
+
+
 def emoji(value: str) -> int:
-    # Curated toolbar choices are one grapheme or a short emoji sequence.
-    if not value or len(value) > 16 or any(ord(char) < 0x20 for char in value):
+    # Only permit a glyph from the installed, data-only emoji catalogue.
+    if value not in {item["emoji"] for item in emoji_records()}:
         return 1
     try:
         result = subprocess.run(["wtype", "--", value], check=False, timeout=2,
@@ -86,13 +140,74 @@ def emoji(value: str) -> int:
         return 1
 
 
-def protocol7() -> int:
-    """Use Protocol7's configured evdev hotkey compatibility bridge.
+def history_records(filter_text: str) -> list[dict]:
+    needle = query(filter_text)
+    if needle is None:
+        return []
+    try:
+        if not HISTORY_FILE.is_file() or HISTORY_FILE.stat().st_size > 2_000_000:
+            return []
+        data = json.loads(HISTORY_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    if not isinstance(data, list):
+        return []
+    entries = []
+    for index, item in enumerate(data[:HISTORY_LIMIT]):
+        if not isinstance(item, dict) or not isinstance(item.get("timestamp"), (int, float)) or not isinstance(item.get("text"), str):
+            continue
+        timestamp, text = float(item["timestamp"]), item["text"]
+        if not math_is_timestamp(timestamp) or not text or len(text) > MAX_HISTORY_TEXT:
+            continue
+        if needle and needle not in text.casefold():
+            continue
+        entries.append({"id": index, "timestamp": timestamp, "text": text})
+    return sorted(entries, key=lambda item: item["timestamp"], reverse=True)
 
-    Its installed IPC exports `debug()` only, not a dictation method. ydotool
-    writes validated Linux key events through uinput so Protocol7's physical
-    hotkey listener receives the same configured sequence without focus moves.
-    """
+
+def math_is_timestamp(value: float) -> bool:
+    return value == value and value not in (float("inf"), float("-inf")) and 0 < value < 9_999_999_999
+
+
+def dictation_list(filter_text: str) -> int:
+    return emit({"items": history_records(filter_text)})
+
+
+def paste_text(text: str) -> int:
+    """Paste bytes via stdin when possible; no user text becomes an argv command."""
+    try:
+        if shutil.which("wl-copy") and shutil.which("wtype"):
+            copied = subprocess.run(["wl-copy", "--type", "text/plain;charset=utf-8"],
+                                    input=text.encode("utf-8"), check=False, timeout=2,
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if copied.returncode == 0:
+                pasted = subprocess.run(["wtype", "-M", "ctrl", "-k", "v", "-m", "ctrl"],
+                                        check=False, timeout=2, stdout=subprocess.DEVNULL,
+                                        stderr=subprocess.DEVNULL)
+                return 0 if pasted.returncode == 0 else 1
+        result = subprocess.run(["wtype", "--", text], check=False, timeout=2,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return 0 if result.returncode == 0 else 1
+    except (OSError, subprocess.SubprocessError):
+        return 1
+
+
+def dictation_insert(index_text: str, timestamp_text: str) -> int:
+    if not re.fullmatch(r"\d{1,4}", index_text) or not re.fullmatch(r"\d{1,10}(?:\.\d{1,6})?", timestamp_text):
+        return 1
+    index, timestamp = int(index_text), float(timestamp_text)
+    if index >= HISTORY_LIMIT:
+        return 1
+    # Re-read the existing Protocol7 source at action time. The id/timestamp
+    # pair prevents a stale filtered row from selecting a different utterance.
+    for item in history_records(""):
+        if item["id"] == index and abs(item["timestamp"] - timestamp) < 0.0001:
+            return paste_text(item["text"])
+    return 1
+
+
+def protocol7() -> int:
+    """Use Protocol7's configured evdev hotkey compatibility bridge."""
     if not shutil.which("ydotool"):
         return 1
     path = Path.home() / ".config" / "protocol-7" / "config.json"
@@ -109,53 +224,39 @@ def protocol7() -> int:
     if any(key < 1 or key > 767 for key in values):
         return 1
     try:
-        # Protocol7 treats a repeated-key list (the default is [29, 29]) as a
-        # multi-tap sequence, not a simultaneous combo. Its listener rejects
-        # duplicate/echoed releases closer than 40 ms, so preserve the same
-        # semantics here instead of sending both downs together.
         if len(set(values)) == 1:
             for index, key in enumerate(values):
-                result = subprocess.run(
-                    ["ydotool", "key", f"{key}:1", f"{key}:0"],
-                    check=False,
-                    timeout=2,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                )
+                result = subprocess.run(["ydotool", "key", f"{key}:1", f"{key}:0"],
+                                        check=False, timeout=2, stdout=subprocess.DEVNULL,
+                                        stderr=subprocess.DEVNULL)
                 if result.returncode != 0:
                     return 1
                 if index + 1 < len(values):
                     time.sleep(0.06)
             return 0
-
-        # Distinct configured keys are a simultaneous combo: press all, then
-        # release in reverse order like a physical chord.
-        events = [f"{key}:1" for key in values] + [
-            f"{key}:0" for key in reversed(values)
-        ]
-        result = subprocess.run(
-            ["ydotool", "key", *events],
-            check=False,
-            timeout=2,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
+        events = [f"{key}:1" for key in values] + [f"{key}:0" for key in reversed(values)]
+        result = subprocess.run(["ydotool", "key", *events], check=False, timeout=2,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         return 0 if result.returncode == 0 else 1
     except (OSError, subprocess.SubprocessError):
         return 1
 
 
 def main() -> int:
-    if len(sys.argv) < 2:
-        return 2
-    command = sys.argv[1]
-    if command == "clipboard-list" and len(sys.argv) == 2:
-        return clipboard_list()
-    if command == "clipboard-paste" and len(sys.argv) == 3:
-        return clipboard_paste(sys.argv[2])
-    if command == "emoji" and len(sys.argv) == 3:
-        return emoji(sys.argv[2])
-    if command == "protocol7" and len(sys.argv) == 2:
+    command, args = (sys.argv[1], sys.argv[2:]) if len(sys.argv) > 1 else ("", [])
+    if command == "clipboard-list" and len(args) <= 1:
+        return clipboard_list(args[0] if args else "")
+    if command == "clipboard-paste" and len(args) == 1:
+        return clipboard_paste(args[0])
+    if command == "emoji-list" and len(args) == 3:
+        return emoji_list(args[0], args[1], args[2])
+    if command == "emoji" and len(args) == 1:
+        return emoji(args[0])
+    if command == "dictation-list" and len(args) <= 1:
+        return dictation_list(args[0] if args else "")
+    if command == "dictation-insert" and len(args) == 2:
+        return dictation_insert(args[0], args[1])
+    if command == "protocol7" and not args:
         return protocol7()
     return 2
 

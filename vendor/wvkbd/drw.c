@@ -155,6 +155,35 @@ drw_draw_text(struct drwsurf *ds, Color color, uint32_t x, uint32_t y,
     cairo_restore(d->cairo);
 }
 
+/* A separate primitive instead of a chain of key highlights. Cairo's round
+ * caps and antialiasing make the trail read as one continuous finger path. */
+void
+drw_draw_polyline(struct drwsurf *ds, Color color, const uint16_t *xs,
+                  const uint16_t *ys, size_t count, double width)
+{
+    if (count < 2)
+        return;
+
+    drwsurf_flip(ds);
+    struct drwbuf *d = ds->back_buffer;
+    drwsurf_damage(ds, 0, 0, ds->width, ds->height);
+
+    cairo_save(d->cairo);
+    cairo_set_antialias(d->cairo, CAIRO_ANTIALIAS_BEST);
+    cairo_set_line_cap(d->cairo, CAIRO_LINE_CAP_ROUND);
+    cairo_set_line_join(d->cairo, CAIRO_LINE_JOIN_ROUND);
+    cairo_set_line_width(d->cairo, width);
+    cairo_set_source_rgba(d->cairo, color.bgra[2] / (double)255,
+                          color.bgra[1] / (double)255,
+                          color.bgra[0] / (double)255,
+                          color.bgra[3] / (double)255);
+    cairo_move_to(d->cairo, xs[0], ys[0]);
+    for (size_t i = 1; i < count; i++)
+        cairo_line_to(d->cairo, xs[i], ys[i]);
+    cairo_stroke(d->cairo);
+    cairo_restore(d->cairo);
+}
+
 void
 drw_do_clear(struct drwsurf *ds, uint32_t x, uint32_t y, uint32_t w, uint32_t h)
 {

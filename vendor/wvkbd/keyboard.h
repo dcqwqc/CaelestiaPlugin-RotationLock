@@ -5,6 +5,10 @@
 
 #define MAX_LAYERS 25
 #define GLIDE_PATH_MAX 96
+/* A complete gesture message, including its live layout, remains comfortably
+ * below PIPE_BUF. Keeping the capture bounded is important: the decoder is a
+ * best-effort companion and must never be able to stall key rendering. */
+#define GLIDE_SAMPLE_MAX 40
 
 enum key_type;
 enum key_modifier_type;
@@ -114,6 +118,12 @@ struct kbd {
 	bool glide_active;
 	char glide_path[GLIDE_PATH_MAX];
 	size_t glide_path_len;
+	/* Pointer/touch positions are kept as actual surface pixels while drawing,
+	 * and normalized only when serialising to the asynchronous decoder pipe. */
+	uint16_t glide_x[GLIDE_SAMPLE_MAX];
+	uint16_t glide_y[GLIDE_SAMPLE_MAX];
+	uint32_t glide_time[GLIDE_SAMPLE_MAX];
+	size_t glide_sample_len;
 	uint32_t w, h;
 	uint32_t padding; // gap between the key grid and the edge of the keyboard
 	double scale;
@@ -166,6 +176,7 @@ void kbd_print_first_utf8_char_stdout(const char *str);
 void kbd_clear_last_popup(struct kbd *kb);
 void kbd_draw_key(struct kbd *kb, struct key *k, enum key_draw_type);
 void kbd_draw_layout(struct kbd *kb);
+void kbd_draw_glide_trail(struct kbd *kb);
 void kbd_resize(struct kbd *kb, struct layout *layouts, uint8_t layoutcount);
 uint8_t kbd_get_rows(struct layout *l);
 double kbd_get_row_length(struct key *k);

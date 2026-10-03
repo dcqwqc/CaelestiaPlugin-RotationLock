@@ -974,9 +974,10 @@ class Handle:
             if isinstance(value, str) and value:
                 env[var] = "#" + value.lstrip("#")
         for var, role in (
-            ("YOGA_TOOLBAR_SURFACE", "surfaceContainer"),
+            ("YOGA_TOOLBAR_SURFACE", "surface"),
             ("YOGA_TOOLBAR_KEY", "surfaceContainerHigh"),
             ("YOGA_TOOLBAR_TEXT", "onSurface"),
+            ("YOGA_TOOLBAR_MUTED", "onSurfaceVariant"),
         ):
             value = colours.get(role)
             if isinstance(value, str) and value:

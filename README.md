@@ -28,26 +28,34 @@ from a cache directory is required. Install it for the current user with:
 
     ./scripts/build-wvkbd
 
-The normal layer is deliberately sparse and touch-friendly: letters, numbers,
-and explicit Esc, Ctrl, Alt, Super, and Tab stay available while arrows,
-navigation keys, Insert/Delete, and F1–F12 live in the Tools layer. A compact
-top row is part of the keyboard's own exclusive-zone footprint and provides
-Keyboard, Clipboard, Emoji, Tools, Protocol7, and Hide controls.
+The normal layer keeps desktop essentials such as Esc, Ctrl, Alt, Super and Tab,
+while navigation keys, Insert/Delete and F1-F12 live on the desktop layer. A
+compact icon row stays visible for the whole lifetime of the OSK and switches
+between keyboard, clipboard, emoji, desktop controls and Protocol7 dictation
+history. The microphone is an action rather than a mode, so starting or stopping
+Protocol7 does not dismiss the keyboard or replace the current panel.
 
-Clipboard history is available only with `cliphist`, `wl-paste`, `wl-copy`, and
-`wtype`; it displays at most eight entries and passes selected bytes directly
-to `wl-copy`, never through a shell. Emoji uses `wtype` and the installed emoji
-font fallback. Protocol7 currently exports no dictation IPC method, so its
-button injects the configured physical hotkey through `ydotool` as a
-compatibility bridge.
+Clipboard, emoji and dictation history are full keyboard-area panels: native
+keys are completely covered while the panel is open. Clipboard history is
+searchable and uses `cliphist`; dictation history reads Protocol7's existing
+`~/.config/protocol-7/history.json` rather than creating another database. The
+emoji browser searches the local Noctalia emoji catalogue (currently 1,913
+entries), exposes category filters and loads additional pages while scrolling.
+Each search field has its own touch keyboard, so filtering does not require a
+physical keyboard. Clipboard and history text are passed only through argv/stdin
+helpers and are never evaluated as shell commands.
 
-Glide typing captures a drag over alphabetic keys without emitting the crossed
-letters. The plugin-owned decoder scores local German/English hunspell
-dictionaries (or its compact fallback lexicon) outside the keyboard process
-and inserts one predicted word. It only enables when the vendored keyboard,
-decoder, lexicon, and `wtype` validation succeed; otherwise ordinary taps are
-unchanged. Long-pressing a, o, u, s, e, period, hyphen, or apostrophe emits a
-useful German/Latin alternate.
+Glide typing records the actual touch trajectory instead of merely collecting
+the keys crossed by the finger. wvkbd draws a continuous anti-aliased trail and
+sends a bounded `(x, y, time)` trace plus the live key-centre geometry to an
+asynchronous decoder. The decoder uniformly resamples the path, creates ideal
+word traces from the current keyboard geometry, prunes by start/end anchors and
+combines shape, location, path-length, corner/order and repeated-letter evidence.
+This is an original compact implementation informed by the SHARK2 family and the
+open geometric architecture used by CleverKeys; it does not depend on Android or
+a proprietary swipe library. German and English use local hunspell dictionaries
+when present and fall back to the tracked compact lexicon. Long-press alternates
+and primary-touch ownership remain active.
 
 ## Legacy helper commands
 

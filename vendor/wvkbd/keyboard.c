@@ -2,8 +2,10 @@
 #include <linux/input-event-codes.h>
 #include <stddef.h>
 #include <stdio.h>
+#include <stdint.h>
 #include <sys/mman.h>
 #include <ctype.h>
+#include <unistd.h>
 #include "keyboard.h"
 #include "drw.h"
 #include "os-compatibility.h"
@@ -394,7 +396,7 @@ glide_letter(struct kbd *kb, struct key *k)
 {
     return kb->glide_enabled && !kb->mods && !kb->compose && k &&
            k->type == Code && strlen(k->label) == 1 &&
-           isalpha((unsigned char)k->label[0]);
+           k->label[0] >= 'a' && k->label[0] <= 'z';
 }
 
 static uint32_t
@@ -435,6 +437,95 @@ glide_append(struct kbd *kb, struct key *k)
     kb->glide_last = k;
 }
 
+/* The raw stream can be much denser than a useful decoding trace. Sample at
+ * roughly display cadence, retain the whole gesture when it gets long, and
+ * never keep enough points to risk a non-atomic pipe message. */
+static void
+glide_sample(struct kbd *kb, uint32_t time, uint32_t x, uint32_t y, bool force)
+{
+    if (kb->glide_sample_len) {
+        size_t last = kb->glide_sample_len - 1;
+        int dx = (int)x - (int)kb->glide_x[last];
+        int dy = (int)y - (int)kb->glide_y[last];
+        uint32_t elapsed = time - kb->glide_time[last];
+        if (!force && elapsed < 12 && dx * dx + dy * dy < 36)
+            return;
+    }
+    if (kb->glide_sample_len == GLIDE_SAMPLE_MAX) {
+        size_t to = 1;
+        for (size_t from = 2; from < kb->glide_sample_len; from += 2, to++) {
+            kb->glide_x[to] = kb->glide_x[from];
+            kb->glide_y[to] = kb->glide_y[from];
+            kb->glide_time[to] = kb->glide_time[from];
+        }
+        kb->glide_sample_len = to;
+    }
+    size_t at = kb->glide_sample_len++;
+    kb->glide_x[at] = (uint16_t)(x > UINT16_MAX ? UINT16_MAX : x);
+    kb->glide_y[at] = (uint16_t)(y > UINT16_MAX ? UINT16_MAX : y);
+    kb->glide_time[at] = time;
+}
+
+static unsigned
+glide_normalize(uint32_t value, uint32_t extent)
+{
+    if (!extent)
+        return 0;
+    unsigned normalized = (unsigned)((value * 1000ULL + extent / 2) / extent);
+    return normalized > 1000 ? 1000 : normalized;
+}
+
+/* One compact JSON line is written exactly once, at release. It contains no
+ * focused-app text and no executable data: only this surface's sampled path
+ * and live letter-centre geometry. A <= 4 KiB write is atomic on POSIX pipes. */
+static void
+glide_emit(struct kbd *kb)
+{
+    char message[3072];
+    size_t used = 0;
+    int written = snprintf(message, sizeof(message),
+                           "{\"v\":1,\"w\":%u,\"h\":%u,\"p\":[",
+                           kb->w, kb->h);
+    if (written < 0 || (size_t)written >= sizeof(message))
+        return;
+    used = (size_t)written;
+    for (size_t i = 0; i < kb->glide_sample_len; i++) {
+        written = snprintf(message + used, sizeof(message) - used,
+                           "%s[%u,%u,%u]", i ? "," : "",
+                           glide_normalize(kb->glide_x[i], kb->w),
+                           glide_normalize(kb->glide_y[i], kb->h),
+                           kb->glide_time[i] - kb->glide_started_at);
+        if (written < 0 || (size_t)written >= sizeof(message) - used)
+            return;
+        used += (size_t)written;
+    }
+    written = snprintf(message + used, sizeof(message) - used, "],\"k\":[");
+    if (written < 0 || (size_t)written >= sizeof(message) - used)
+        return;
+    used += (size_t)written;
+
+    bool first = true;
+    for (struct key *key = kb->layout->keys; key->type != Last; key++) {
+        if (!glide_letter(kb, key))
+            continue;
+        written = snprintf(message + used, sizeof(message) - used,
+                           "%s[\"%c\",%u,%u]", first ? "" : ",",
+                           key->label[0],
+                           glide_normalize(key->x + key->w / 2, kb->w),
+                           glide_normalize(key->y + key->h / 2, kb->h));
+        if (written < 0 || (size_t)written >= sizeof(message) - used)
+            return;
+        used += (size_t)written;
+        first = false;
+    }
+    written = snprintf(message + used, sizeof(message) - used, "]}\n");
+    if (written < 0 || (size_t)written >= sizeof(message) - used)
+        return;
+    used += (size_t)written;
+    if (used < 4096 && kb->glide_fd >= 0)
+        (void)write(kb->glide_fd, message, used);
+}
+
 void
 kbd_begin_key(struct kbd *kb, struct key *k, uint32_t time, uint32_t x,
               uint32_t y)
@@ -452,9 +543,12 @@ kbd_begin_key(struct kbd *kb, struct key *k, uint32_t time, uint32_t x,
     kb->glide_started_at = time;
     kb->glide_active = false;
     kb->glide_path_len = 0;
+    kb->glide_sample_len = 0;
     kb->glide_path[0] = '\0';
-    if (glide_letter(kb, k))
+    if (glide_letter(kb, k)) {
         glide_append(kb, k);
+        glide_sample(kb, time, x, y, true);
+    }
     kbd_draw_key(kb, k, Press);
 }
 
@@ -467,11 +561,11 @@ kbd_finish_key(struct kbd *kb, uint32_t time)
     }
 
     struct key *key = kb->glide_pending;
-    if (kb->glide_active && kb->glide_path_len >= 2) {
-        /* A single short write is atomic for a pipe and has no shell or text
-         * interpretation.  The plugin-owned decoder reads this fd off-thread. */
-        if (kb->glide_fd >= 0)
-            dprintf(kb->glide_fd, "%s\n", kb->glide_path);
+    if (kb->glide_active && kb->glide_sample_len >= 2) {
+        glide_sample(kb, time, kb->glide_x[kb->glide_sample_len - 1],
+                     kb->glide_y[kb->glide_sample_len - 1], true);
+        if (kb->glide_sample_len >= 3)
+            glide_emit(kb);
         kbd_draw_layout(kb);
     } else {
         uint32_t upper, code = alternate_code(key, &upper);
@@ -489,6 +583,7 @@ kbd_finish_key(struct kbd *kb, uint32_t time)
     kb->glide_last = NULL;
     kb->glide_active = false;
     kb->glide_path_len = 0;
+    kb->glide_sample_len = 0;
     kb->glide_path[0] = '\0';
     kbd_clear_last_popup(kb);
 }
@@ -501,6 +596,7 @@ kbd_cancel_key(struct kbd *kb, uint32_t time)
         kb->glide_last = NULL;
         kb->glide_active = false;
         kb->glide_path_len = 0;
+        kb->glide_sample_len = 0;
         kb->glide_path[0] = '\0';
         kbd_draw_layout(kb);
     }
@@ -515,16 +611,23 @@ kbd_motion_key(struct kbd *kb, uint32_t time, uint32_t x, uint32_t y)
         struct key *next = kbd_get_key(kb, x, y);
         uint32_t dx = x > kb->glide_start_x ? x - kb->glide_start_x : kb->glide_start_x - x;
         uint32_t dy = y > kb->glide_start_y ? y - kb->glide_start_y : kb->glide_start_y - y;
+        if (glide_letter(kb, kb->glide_pending))
+            glide_sample(kb, time, x, y, false);
+        uint32_t threshold = kb->layout->keyheight / 4;
+        if (threshold < 12)
+            threshold = 12;
+        if (threshold > 28)
+            threshold = 28;
         if (glide_letter(kb, next) &&
-            (dx * dx + dy * dy >= 64) && next != kb->glide_pending) {
+            (dx * dx + dy * dy >= threshold * threshold)) {
             if (!kb->glide_active) {
                 kb->glide_active = true;
-                kbd_draw_key(kb, kb->glide_pending, Swipe);
             }
             if (next != kb->glide_last) {
                 glide_append(kb, next);
-                kbd_draw_key(kb, next, Swipe);
             }
+            kbd_draw_layout(kb);
+            kbd_draw_glide_trail(kb);
         }
         kbd_clear_last_popup(kb);
         return;
@@ -550,6 +653,21 @@ kbd_motion_key(struct kbd *kb, uint32_t time, uint32_t x, uint32_t y)
     }
 
     kbd_clear_last_popup(kb);
+}
+
+void
+kbd_draw_glide_trail(struct kbd *kb)
+{
+    if (!kb->glide_active || kb->glide_sample_len < 2)
+        return;
+    Color trail = kb->schemes[0].swipe;
+    if (trail.bgra[3] > 170)
+        trail.bgra[3] = 170;
+    double width = kb->layout->keyheight * 0.11;
+    if (width < 3.0)
+        width = 3.0;
+    drw_draw_polyline(kb->surf, trail, kb->glide_x, kb->glide_y,
+                      kb->glide_sample_len, width);
 }
 
 void
