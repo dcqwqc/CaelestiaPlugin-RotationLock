@@ -56,9 +56,14 @@ space is redistributed to the real key rows, keeping the keyboard footprint and
 window-resize inset unchanged while making the icon bar visibly tighter. Its
 layer surface stays mapped and transparent at the screen bottom while the OSK is
 closed; opening the OSK raises that resident surface vertically with the keyboard,
-so the toolbar never receives a separate sideways compositor entrance. Toolbar
-grey pills are pointer-hover previews only (mouse/touchpad/stylus); touch taps
-select immediately and the underline alone represents the active mode.
+so the toolbar never receives a separate sideways compositor entrance. Vertical
+open/close motion now has one authoritative QML clock: its 230 ms OutCubic
+motionInset value positions the toolbar and grab handle directly and is streamed
+frame-for-frame over a private mode-0600 Unix socket to the daemon, which applies
+the matching native wvkbd y offset. There is no second toolbar/native timer to
+drift. Toolbar grey pills are pointer-hover previews only
+(mouse/touchpad/stylus); touch taps select immediately and the underline alone
+represents the active mode.
 Clipboard history is searchable and uses `cliphist`;
 dictation history reads Protocol7's existing
 `~/.config/protocol-7/history.json` rather than creating another database. The

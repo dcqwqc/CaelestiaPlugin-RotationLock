@@ -51,6 +51,14 @@ ShellRoot {
     property bool oskStateVisible: false
     property real oskStateInset: 0
     property real lastOskInset: 0
+
+    // One vertical motion clock owns both the QML toolbar and native wvkbd.
+    property real motionInset: 0
+    property real motionTargetInset: 0
+    property bool motionTargetVisible: false
+    property bool motionAnimating: false
+    property int motionSequence: 0
+
     readonly property bool closing: oskStateLoaded ? oskStateVisible : envClosing
     // In close mode this is the keyboard's height. Keep the handle immediately
     // ABOVE wvkbd instead of inside its surface.
@@ -62,15 +70,83 @@ ShellRoot {
         target: "yogaOsk"
 
         function setState(visible: string, inset: string): string {
-            root.oskStateVisible = visible === "1";
+            const shown = visible === "1";
             const parsed = parseFloat(inset);
-            root.oskStateInset = root.oskStateVisible && !isNaN(parsed)
-                ? Math.max(0, parsed)
-                : 0;
-            if (root.oskStateInset > 0)
-                root.lastOskInset = root.oskStateInset;
+            const target = shown && !isNaN(parsed) ? Math.max(0, parsed) : 0;
+
+            verticalMotion.stop();
+            root.motionAnimating = false;
+            root.oskStateVisible = shown;
+            root.oskStateInset = target;
+            if (target > 0)
+                root.lastOskInset = target;
+            root.motionTargetInset = target > 0 ? target : root.lastOskInset;
+            root.motionTargetVisible = shown;
+            root.motionInset = target;
             root.oskStateLoaded = true;
             return "ok";
+        }
+
+        function animateState(visible: string, inset: string, sequence: string): string {
+            if (!motionSocket.connected)
+                return "not-ready";
+
+            const shown = visible === "1";
+            const parsed = parseFloat(inset);
+            const target = !isNaN(parsed) ? Math.max(1, parsed) : 1;
+            const seq = parseInt(sequence);
+
+            verticalMotion.stop();
+            root.motionSequence = isNaN(seq) ? root.motionSequence + 1 : seq;
+            root.motionTargetInset = target;
+            root.motionTargetVisible = shown;
+            root.oskStateVisible = shown;
+            root.oskStateInset = shown ? target : 0;
+            root.lastOskInset = target;
+            root.oskStateLoaded = true;
+            root.motionAnimating = true;
+
+            verticalMotion.from = root.motionInset;
+            verticalMotion.to = shown ? target : 0;
+            root.pushMotionFrame();
+            verticalMotion.start();
+            return "ok";
+        }
+    }
+
+    Socket {
+        id: motionSocket
+        path: `${Quickshell.env("XDG_RUNTIME_DIR")}/yoga-tablet-motion.sock`
+        connected: true
+    }
+
+    function pushMotionFrame(): void {
+        if (!motionSocket.connected || root.motionTargetInset <= 0)
+            return;
+        const nativeY = Math.round(root.motionInset - root.motionTargetInset);
+        motionSocket.write(`y ${root.motionSequence} ${nativeY}
+`);
+        motionSocket.flush();
+    }
+
+    onMotionInsetChanged: root.pushMotionFrame()
+
+    NumberAnimation {
+        id: verticalMotion
+        target: root
+        property: "motionInset"
+        duration: 230
+        easing.type: Easing.OutCubic
+        onFinished: {
+            root.pushMotionFrame();
+            if (motionSocket.connected) {
+                motionSocket.write(
+                    `done ${root.motionSequence} ${root.motionTargetVisible ? 1 : 0}
+`
+                );
+                motionSocket.flush();
+            }
+            root.motionAnimating = false;
         }
     }
 
@@ -87,6 +163,12 @@ ShellRoot {
                 root.oskStateInset = root.oskStateVisible ? Math.max(0, Number(state.inset) || 0) : 0;
                 if (root.oskStateInset > 0)
                     root.lastOskInset = root.oskStateInset;
+                if (!root.motionAnimating) {
+                    root.motionTargetInset = root.oskStateInset > 0
+                        ? root.oskStateInset : root.lastOskInset;
+                    root.motionTargetVisible = root.oskStateVisible;
+                    root.motionInset = root.oskStateInset;
+                }
                 root.oskStateLoaded = true;
             } catch (_) {
                 root.oskStateLoaded = false;
@@ -112,7 +194,8 @@ ShellRoot {
     // Gboard-style utility row. The auxiliary panes occupy the rest of the
     // keyboard footprint and fully cover the native keys without stopping them.
     readonly property bool toolbarEnabled: envStr("YOGA_TOOLBAR_ENABLED", "1") === "1"
-    readonly property bool toolbarVisible: closing && toolbarEnabled
+    readonly property bool toolbarVisible: toolbarEnabled
+        && (closing || motionAnimating || motionInset > 0.5)
     property bool furnitureReady: false
     readonly property bool toolbarRaised: toolbarVisible && furnitureReady
     readonly property bool clipboardEnabled: envStr("YOGA_CLIPBOARD_ENABLED", "1") === "1"
@@ -128,15 +211,11 @@ ShellRoot {
             / (keyboardRows - 1 + toolbarRowWeight)) + oskPadding
     )
     readonly property real toolbarButtonHeight: Math.min(36, Math.max(30, toolbarHeight - 16))
-    readonly property real toolbarBottom: Math.max(0, effectiveBottom - toolbarHeight)
-    property real toolbarLift: toolbarRaised ? toolbarBottom : -toolbarHeight
-
-    Behavior on toolbarLift {
-        NumberAnimation {
-            duration: 230
-            easing.type: Easing.OutCubic
-        }
-    }
+    readonly property real toolbarBottom: Math.max(0, toolbarReferenceBottom - toolbarHeight)
+    // No independent Behavior: this is a direct projection of motionInset.
+    readonly property real toolbarLift: furnitureReady
+        ? root.motionInset - toolbarHeight
+        : -toolbarHeight
     readonly property color toolbarSurface: envStr("YOGA_TOOLBAR_SURFACE", "#1b1b1f")
     readonly property color toolbarKey: envStr("YOGA_TOOLBAR_KEY", "#303034")
     readonly property color toolbarText: envStr("YOGA_TOOLBAR_TEXT", "#f4f0f6")
@@ -481,9 +560,6 @@ ShellRoot {
             color: root.toolbarSurface
             opacity: root.toolbarRaised ? 1 : 0
 
-            Behavior on opacity {
-                NumberAnimation { duration: 90 }
-            }
         }
 
         Item {
@@ -493,9 +569,6 @@ ShellRoot {
             height: root.toolbarButtonHeight
             opacity: root.toolbarRaised ? 1 : 0
 
-            Behavior on opacity {
-                NumberAnimation { duration: 90 }
-            }
 
             Row {
                 id: toolbarRow
@@ -1154,7 +1227,7 @@ ShellRoot {
         anchors.left: true
         anchors.bottom: true
         margins.left: root.leftMargin
-        margins.bottom: root.closing ? root.effectiveBottom : 0
+        margins.bottom: root.motionInset
 
         implicitWidth: root.barWidth
         implicitHeight: root.barHeight

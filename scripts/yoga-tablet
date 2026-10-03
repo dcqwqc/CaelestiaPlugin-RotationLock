@@ -61,6 +61,7 @@ SOCKET_PATH = RUNTIME_DIR / f"{APP}.sock"
 # ignores exclusive zones, so it cannot see the keyboard the way ordinary
 # windows do and needs to be handed the number.
 OSK_STATE_PATH = RUNTIME_DIR / f"{APP}-osk.json"
+MOTION_SOCKET_PATH = RUNTIME_DIR / f"{APP}-motion.sock"
 # Child PID files let a fresh daemon clean up plugin-owned children left behind
 # by an unclean Caelestia/Quickshell restart.
 OSK_PID_PATH = RUNTIME_DIR / f"{APP}-wvkbd.pid"
@@ -956,6 +957,15 @@ class Osk:
         threading.Thread(target=run, name="yoga-osk-surface-motion", daemon=True).start()
         return True
 
+    def cancel_surface_animation(self) -> None:
+        with self._slide_lock:
+            self._slide_generation += 1
+
+    def apply_external_vertical_frame(self, y: int) -> bool:
+        with self._slide_lock:
+            x = self._surface_x
+        return self._write_surface_offset(x, int(y))
+
     def set_offset(self, offset: int) -> bool:
         return self.set_surface_offset(x=offset)
 
@@ -1118,6 +1128,28 @@ class Handle:
             return False
 
 
+    def animate_osk_state(self, visible: bool, inset: int, sequence: int) -> bool:
+        """Start the single QML-owned vertical motion clock."""
+        if not self._alive() or self.proc is None:
+            return False
+        args = [
+            "qs", "ipc", "--pid", str(self.proc.pid),
+            "call", "yogaOsk", "animateState",
+            "1" if visible else "0", str(max(1, int(inset))), str(int(sequence)),
+        ]
+        for _ in range(16):
+            try:
+                result = subprocess.run(
+                    args, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                    text=True, timeout=0.25, check=False,
+                )
+            except (OSError, subprocess.SubprocessError):
+                return False
+            if result.returncode == 0 and "not-ready" not in result.stdout:
+                return True
+            time.sleep(0.02)
+        return False
+
     def _env(self, monitor: str | None, mode: str, bottom: int) -> dict:
         env = dict(os.environ)
         env["YOGA_HANDLE_BIN"] = str(Path(sys.argv[0]).resolve())
@@ -1198,6 +1230,113 @@ class Handle:
 # --------------------------------------------------------------------------
 
 
+class MotionServer:
+    """Persistent local channel from the QML motion clock to native wvkbd."""
+
+    def __init__(self, osk: Osk):
+        self.osk = osk
+        self.sock: socket.socket | None = None
+        self.thread: threading.Thread | None = None
+        self.stopping = threading.Event()
+        self.lock = threading.Lock()
+        self.sequence = 0
+        self.done_event = threading.Event()
+
+    def start(self) -> None:
+        if self.thread is not None and self.thread.is_alive():
+            return
+        MOTION_SOCKET_PATH.unlink(missing_ok=True)
+        srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        srv.bind(str(MOTION_SOCKET_PATH))
+        os.chmod(MOTION_SOCKET_PATH, 0o600)
+        srv.listen(2)
+        srv.settimeout(0.25)
+        self.sock = srv
+        self.stopping.clear()
+        self.thread = threading.Thread(
+            target=self._serve, name="yoga-osk-motion-socket", daemon=True
+        )
+        self.thread.start()
+
+    def stop(self) -> None:
+        self.stopping.set()
+        if self.sock is not None:
+            try:
+                self.sock.close()
+            except OSError:
+                pass
+        self.sock = None
+        if self.thread is not None:
+            self.thread.join(timeout=0.6)
+        self.thread = None
+        MOTION_SOCKET_PATH.unlink(missing_ok=True)
+
+    def begin(self) -> int:
+        with self.lock:
+            self.sequence += 1
+            self.done_event.clear()
+            seq = self.sequence
+        self.osk.cancel_surface_animation()
+        return seq
+
+    def wait(self, sequence: int, timeout: float = 0.7) -> bool:
+        with self.lock:
+            if sequence != self.sequence:
+                return False
+        return self.done_event.wait(timeout)
+
+    def _handle_line(self, line: str) -> None:
+        parts = line.strip().split()
+        if len(parts) < 3:
+            return
+        try:
+            seq = int(parts[1])
+        except ValueError:
+            return
+        with self.lock:
+            if seq != self.sequence:
+                return
+        if parts[0] == "y":
+            try:
+                y = int(parts[2])
+            except ValueError:
+                return
+            self.osk.apply_external_vertical_frame(y)
+        elif parts[0] == "done":
+            self.done_event.set()
+
+    def _serve_client(self, conn: socket.socket) -> None:
+        conn.settimeout(0.5)
+        pending = ""
+        while not self.stopping.is_set():
+            try:
+                chunk = conn.recv(4096)
+            except socket.timeout:
+                continue
+            except OSError:
+                return
+            if not chunk:
+                return
+            pending += chunk.decode("ascii", errors="ignore")
+            while chr(10) in pending:
+                line, pending = pending.split(chr(10), 1)
+                self._handle_line(line)
+
+    def _serve(self) -> None:
+        srv = self.sock
+        if srv is None:
+            return
+        while not self.stopping.is_set():
+            try:
+                conn, _ = srv.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                return
+            with conn:
+                self._serve_client(conn)
+
+
 class Accelerometer:
     def __init__(self, cfg: dict):
         self.cfg = cfg
@@ -1256,6 +1395,7 @@ class Daemon:
         self.accel = Accelerometer(cfg)
         self.osk = Osk(cfg)
         self.grab = Handle(cfg)
+        self.motion = MotionServer(self.osk)
         self.lock = threading.RLock()
         self.stopping = threading.Event()
 
@@ -1561,20 +1701,32 @@ class Daemon:
         else:
             self.set_fullscreen_state(address, 2, 2)
 
-    def publish_osk(self, visible: bool, inset: int) -> None:
-        """Hand the shell the keyboard's footprint and motion state."""
-        self.fit_fullscreen_above_keyboard(visible)
-        # The direct IPC is the animation trigger. The state file remains the
-        # durable recovery path for QML restarts and other shell consumers.
-        self.grab.push_osk_state(visible, inset)
+    def _write_osk_state(self, visible: bool, inset: int) -> None:
         try:
             tmp = OSK_STATE_PATH.with_suffix(".tmp")
             with tmp.open("w") as fh:
-                json.dump({"visible": visible, "inset": inset, "tablet_mode": self.tablet_mode}, fh)
-                fh.write("\n")
+                json.dump(
+                    {"visible": visible, "inset": inset, "tablet_mode": self.tablet_mode}, fh
+                )
+                fh.write(chr(10))
             tmp.replace(OSK_STATE_PATH)
         except OSError as exc:
             log(f"could not publish keyboard state: {exc}")
+
+    def publish_osk(self, visible: bool, inset: int) -> None:
+        """Publish a stable/snap state for recovery and post-animation."""
+        self.fit_fullscreen_above_keyboard(visible)
+        self.grab.push_osk_state(visible, inset)
+        self._write_osk_state(visible, inset)
+
+    def animate_osk_state(self, visible: bool, inset: int) -> tuple[int, bool]:
+        """Start one shared QML clock for toolbar and native keyboard motion."""
+        self.fit_fullscreen_above_keyboard(visible)
+        seq = self.motion.begin()
+        started = self.grab.animate_osk_state(visible, inset, seq)
+        if started:
+            self._write_osk_state(visible, inset if visible else 0)
+        return seq, started
 
     def expected_osk_offset(self) -> int:
         """Return the keyboard target height before its layer surface maps."""
@@ -1781,41 +1933,34 @@ class Daemon:
                     }
                 prepared_show = False
                 vertical_travel = 0
-                if arg == "show":
+                if arg == "show" or (arg in (None, "toggle") and not self.osk.visible):
                     if not self.osk.visible:
                         vertical_travel = self.prepare_osk_show()
                         prepared_show = True
                     err = self.osk.show()
                     if err is None and prepared_show and vertical_travel:
-                        self.publish_osk(True, vertical_travel)
-                        self.osk.animate_vertical_show(vertical_travel, delay_ms=60)
-                        time.sleep(0.24)
-                elif arg == "hide":
+                        seq, shared = self.animate_osk_state(True, vertical_travel)
+                        if shared:
+                            self.motion.wait(seq)
+                            self.osk.apply_external_vertical_frame(0)
+                        else:
+                            self.publish_osk(True, vertical_travel)
+                            self.osk.animate_vertical_show(vertical_travel, delay_ms=0)
+                            time.sleep(0.24)
+                elif arg == "hide" or (arg in (None, "toggle") and self.osk.visible):
                     if self.osk.visible:
                         vertical_travel = self.expected_osk_offset()
-                        self.publish_osk(False, 0)
-                        self.osk.animate_vertical_hide(vertical_travel, delay_ms=60)
-                        time.sleep(0.24)
+                        seq, shared = self.animate_osk_state(False, vertical_travel)
+                        if shared:
+                            self.motion.wait(seq)
+                            self.osk.apply_external_vertical_frame(-vertical_travel)
+                        else:
+                            self.publish_osk(False, 0)
+                            self.osk.animate_vertical_hide(vertical_travel, delay_ms=0)
+                            time.sleep(0.24)
                     err = self.osk.hide()
                     if err is None:
                         self.osk.set_surface_offset(y=0)
-                elif arg in (None, "toggle"):
-                    if not self.osk.visible:
-                        vertical_travel = self.prepare_osk_show()
-                        prepared_show = True
-                        err = self.osk.show()
-                        if err is None and vertical_travel:
-                            self.publish_osk(True, vertical_travel)
-                            self.osk.animate_vertical_show(vertical_travel, delay_ms=60)
-                            time.sleep(0.24)
-                    else:
-                        vertical_travel = self.expected_osk_offset()
-                        self.publish_osk(False, 0)
-                        self.osk.animate_vertical_hide(vertical_travel, delay_ms=60)
-                        time.sleep(0.24)
-                        err = self.osk.hide()
-                        if err is None:
-                            self.osk.set_surface_offset(y=0)
                 elif arg == "stop":
                     self.osk.stop()
                     err = None
@@ -1928,6 +2073,7 @@ class Daemon:
         # recorded by the previous owner before taking over.
         cleanup_stale_child(OSK_PID_PATH, "wvkbd-mobintl")
         cleanup_stale_child(HANDLE_PID_PATH, str(Handle.CONFIG_DIR))
+        self.motion.start()
 
         srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         srv.bind(str(SOCKET_PATH))
@@ -1969,6 +2115,7 @@ class Daemon:
             self.set_pointers_enabled(True, force=True)
             self.osk.stop()
             self.grab.stop()
+            self.motion.stop()
             self.publish_osk(False, 0)
             srv.close()
             SOCKET_PATH.unlink(missing_ok=True)
