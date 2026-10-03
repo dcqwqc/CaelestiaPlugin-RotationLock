@@ -580,11 +580,14 @@ ShellRoot {
             id: closeGrabberHitbox
 
             visible: root.toolbarRaised
-            anchors.horizontalCenter: parent.horizontalCenter
+            // Match the opening handle's exact horizontal geometry. The toolbar
+            // itself already starts at leftMargin, so this barWidth-wide hitbox
+            // has the same absolute x origin as the bottom-left opening handle.
+            anchors.left: parent.left
             anchors.top: parent.top
             anchors.topMargin: 2
-            width: 72
-            height: 16
+            width: root.barWidth
+            height: 18
             z: 5
 
             property real pressY: 0
@@ -594,22 +597,31 @@ ShellRoot {
                 anchors.horizontalCenter: parent.horizontalCenter
                 anchors.top: parent.top
                 anchors.topMargin: 5
-                width: closeGrabberArea.pressed ? 44 : 38
-                height: closeGrabberArea.pressed ? 5 : 4
+                // Same visible pill geometry as the opening handle.
+                width: closeGrabberArea.pressed
+                    ? root.barWidth * 0.7
+                    : root.barWidth * 0.55
+                height: closeGrabberArea.pressed ? 6 : 5
                 radius: height / 2
                 color: closeGrabberArea.pressed
                     ? root.grabActiveColour
                     : root.grabColour
-                opacity: closeGrabberArea.pressed ? 1 : 0.52
+                opacity: closeGrabberArea.pressed ? 1 : 0.65
 
                 Behavior on width {
-                    NumberAnimation { duration: 110; easing.type: Easing.OutCubic }
+                    NumberAnimation {
+                        duration: 150
+                        easing.type: Easing.OutCubic
+                    }
                 }
                 Behavior on height {
-                    NumberAnimation { duration: 110; easing.type: Easing.OutCubic }
+                    NumberAnimation {
+                        duration: 150
+                        easing.type: Easing.OutCubic
+                    }
                 }
                 Behavior on opacity {
-                    NumberAnimation { duration: 110 }
+                    NumberAnimation { duration: 150 }
                 }
             }
 
