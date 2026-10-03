@@ -34,13 +34,17 @@ compact icon row stays visible for the whole lifetime of the OSK. Its first
 button is the only keyboard/desktop-tools layer switcher, followed by clipboard,
 emoji, Protocol7 dictation history and voice input. The microphone is an action
 rather than a mode, so starting or stopping Protocol7 does not dismiss the
-keyboard or replace the current panel.
+keyboard or replace the current panel. It talks to Protocol7's local control
+socket directly (with the Caelestia IPC as a startup fallback), so changing the
+user's physical dictation hotkey never changes the toolbar integration.
 
-Clipboard and emoji are full keyboard-area panels: native keys are completely
-covered while either panel is open. Protocol7 dictation history instead opens as
-a drawer above the OSK, so the full native keyboard remains visible and usable.
-Clipboard history is searchable and uses `cliphist`; dictation history reads
-Protocol7's existing
+Keyboard, clipboard, emoji and Protocol7 dictation history form one horizontal
+page deck underneath the fixed icon row. Moving right through the toolbar pushes
+the current page left while the next page enters from the right; moving back
+reverses the motion. The keyboard page is transparent so sliding a utility page
+away progressively reveals the resident native wvkbd beneath it instead of
+restarting the keyboard. Clipboard history is searchable and uses `cliphist`;
+dictation history reads Protocol7's existing
 `~/.config/protocol-7/history.json` rather than creating another database. The
 emoji browser searches the local Noctalia emoji catalogue (currently 1,913
 entries), exposes category filters and loads additional pages while scrolling.

@@ -955,6 +955,7 @@ class Handle:
         env["YOGA_HANDLE_OUTPUT"] = monitor or ""
         env["YOGA_HANDLE_MODE"] = mode
         env["YOGA_HANDLE_BOTTOM"] = str(bottom)
+        env["YOGA_OSK_TARGET_BOTTOM"] = str(bottom if mode == "close" else 0)
         env["YOGA_HANDLE_LEFT"] = str(self.cfg.get("osk_handle_left", 68))
         env["YOGA_HANDLE_WIDTH"] = str(self.cfg.get("osk_handle_width", 190))
         env["YOGA_HANDLE_HEIGHT"] = str(self.cfg.get("osk_handle_height", 26))
@@ -987,14 +988,12 @@ class Handle:
     def start(self, monitor: str | None, mode: str = "open", bottom: int = 0) -> None:
         if not self.cfg.get("osk_handle", True):
             return
-        # The QML reads its mode and position from the environment at spawn, so
-        # moving the strip onto the keyboard means restarting it. That costs a
-        # few hundred milliseconds, which nobody notices behind a keyboard that
-        # is already sliding.
+        # The QML watches OSK_STATE_PATH, so changing open/close geometry does
+        # not require a Quickshell restart. Keeping this process resident is what
+        # lets the toolbar begin its layer animation together with wvkbd.
         if self._alive():
-            if (mode, bottom) == self.state:
-                return
-            self.stop()
+            self.state = (mode, bottom)
+            return
         if not self.available():
             log("no quickshell handle config found; keyboard handle disabled")
             return
@@ -1405,6 +1404,36 @@ class Daemon:
         except OSError as exc:
             log(f"could not publish keyboard state: {exc}")
 
+    def expected_osk_offset(self) -> int:
+        """Return the keyboard target height before its layer surface maps."""
+        remembered = self._osk_offsets.get(self.transform % 2)
+        if remembered:
+            return int(remembered)
+
+        command = self.osk.command
+        flag = "-H" if self.transform % 2 else "-L"
+        try:
+            index = command.index(flag)
+            value = int(command[index + 1])
+            if value > 0:
+                return value
+        except (ValueError, IndexError, TypeError):
+            pass
+        return 560 if self.transform % 2 else 400
+
+    def prepare_osk_show(self) -> None:
+        """Start shell furniture before wvkbd so both layer animations align."""
+        if not self.tablet_mode:
+            return
+        mon = pick_monitor(self.cfg)
+        name = mon.get("name") if mon else None
+        target = self.expected_osk_offset()
+        self.publish_osk(True, target)
+        self.grab.start(name, mode="close", bottom=target)
+        # The resident QML process sees OSK_STATE_PATH immediately; yield a
+        # single frame so its toolbar visibility change is queued before wvkbd.
+        time.sleep(0.016)
+
     def sync_handle(self) -> None:
         """Put the grab strip wherever the keyboard currently isn't.
 
@@ -1574,11 +1603,18 @@ class Daemon:
                         "ok": False,
                         "error": f"{self.osk.command[0]} is not installed",
                     }
+                prepared_show = False
                 if arg == "show":
+                    if not self.osk.visible:
+                        self.prepare_osk_show()
+                        prepared_show = True
                     err = self.osk.show()
                 elif arg == "hide":
                     err = self.osk.hide()
                 elif arg in (None, "toggle"):
+                    if not self.osk.visible:
+                        self.prepare_osk_show()
+                        prepared_show = True
                     err = self.osk.toggle()
                 elif arg == "stop":
                     self.osk.stop()
@@ -1586,6 +1622,9 @@ class Daemon:
                 else:
                     return {"ok": False, "error": "osk takes show|hide|toggle|stop"}
                 if err:
+                    if prepared_show:
+                        self.osk.visible = False
+                        self.sync_handle()
                     return {"ok": False, "error": err}
                 self.sync_handle()
                 return {"ok": True, "osk_visible": self.osk.visible}

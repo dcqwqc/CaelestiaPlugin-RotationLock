@@ -41,13 +41,40 @@ ShellRoot {
     readonly property string actionBin: envStr("YOGA_OSK_ACTION", "")
     readonly property string output: envStr("YOGA_HANDLE_OUTPUT", "")
 
-    // "open" sits on the screen edge and pulls the keyboard up; "close" sits on
-    // top of the keyboard and pushes it back down.
-    readonly property bool closing: envStr("YOGA_HANDLE_MODE", "open") === "close"
-    // In close mode this is the keyboard's height. Keep the handle window
-    // immediately ABOVE wvkbd instead of inside its surface: wvkbd may be on
-    // the same overlay layer and can otherwise paint over the close handle.
-    readonly property real bottomMargin: envNum("YOGA_HANDLE_BOTTOM", 0)
+    // The handle process stays resident while tablet mode is active. Its initial
+    // environment is only a bootstrap fallback; after the first state-file load,
+    // keyboard visibility and geometry follow the daemon live without restarting
+    // Quickshell. This lets the toolbar and wvkbd begin the same layer animation.
+    readonly property bool envClosing: envStr("YOGA_HANDLE_MODE", "open") === "close"
+    readonly property real envBottom: envNum("YOGA_HANDLE_BOTTOM", 0)
+    property bool oskStateLoaded: false
+    property bool oskStateVisible: false
+    property real oskStateInset: 0
+    readonly property bool closing: oskStateLoaded ? oskStateVisible : envClosing
+    // In close mode this is the keyboard's height. Keep the handle immediately
+    // ABOVE wvkbd instead of inside its surface.
+    readonly property real bottomMargin: oskStateLoaded ? oskStateInset : envBottom
+    readonly property real targetBottom: envNum("YOGA_OSK_TARGET_BOTTOM", 0)
+    readonly property real effectiveBottom: bottomMargin > 0 ? bottomMargin : targetBottom
+
+    FileView {
+        id: oskStateFile
+        path: `${Quickshell.env("XDG_RUNTIME_DIR")}/yoga-tablet-osk.json`
+        watchChanges: true
+        printErrors: false
+        onFileChanged: reload()
+        onLoaded: {
+            try {
+                const state = JSON.parse(text());
+                root.oskStateVisible = state.visible === true;
+                root.oskStateInset = root.oskStateVisible ? Math.max(0, Number(state.inset) || 0) : 0;
+                root.oskStateLoaded = true;
+            } catch (_) {
+                root.oskStateLoaded = false;
+            }
+        }
+        onLoadFailed: root.oskStateLoaded = false
+    }
 
     // Clears Caelestia's left bar, which reserves 60px, so the strip never
     // shadows it.
@@ -69,11 +96,11 @@ ShellRoot {
     readonly property bool clipboardEnabled: envStr("YOGA_CLIPBOARD_ENABLED", "1") === "1"
     readonly property real oskPadding: envNum("YOGA_OSK_PADDING", 8)
     readonly property int keyboardRows: (win.screen !== null && win.screen.height > win.screen.width) ? 6 : 5
-    readonly property real toolbarHeight: closing && bottomMargin > 0
-        ? Math.max(42, (bottomMargin - oskPadding * 2) / keyboardRows)
+    readonly property real toolbarHeight: closing && effectiveBottom > 0
+        ? Math.max(42, (effectiveBottom - oskPadding * 2) / keyboardRows)
         : 42
     readonly property real toolbarButtonHeight: Math.min(42, Math.max(34, toolbarHeight - 14))
-    readonly property real toolbarBottom: Math.max(0, bottomMargin - toolbarHeight)
+    readonly property real toolbarBottom: Math.max(0, effectiveBottom - toolbarHeight)
     readonly property color toolbarSurface: envStr("YOGA_TOOLBAR_SURFACE", "#1b1b1f")
     readonly property color toolbarKey: envStr("YOGA_TOOLBAR_KEY", "#303034")
     readonly property color toolbarText: envStr("YOGA_TOOLBAR_TEXT", "#f4f0f6")
@@ -81,6 +108,10 @@ ShellRoot {
 
     property string pane: "keyboard"
     property string nativeLayer: "keyboard"
+    property bool pagerVisible: false
+    property bool pagerTransitioning: false
+    property bool pageAFront: true
+    property string queuedPane: ""
     property string paneQuery: ""
     property bool searchActive: false
     property string emojiCategory: "all"
@@ -89,8 +120,6 @@ ShellRoot {
     property var emojiItems: []
     property var emojiNext: null
     property var historyItems: []
-    property string pendingHistoryId: ""
-    property string pendingHistoryTimestamp: ""
 
     readonly property var toolbarButtons: {
         const buttons = [
@@ -129,20 +158,85 @@ ShellRoot {
         return root.pane === id;
     }
 
-    function openPane(nextPane: string): void {
+    function paneIndex(value: string): int {
+        if (value === "clipboard")
+            return 1;
+        if (value === "emoji")
+            return 2;
+        if (value === "history")
+            return 3;
+        return 0;
+    }
+
+    function finishPagerTransition(): void {
+        const outgoing = root.pageAFront ? pageA : pageB;
+        outgoing.animateX = false;
+        outgoing.visible = false;
+        outgoing.x = 0;
+        root.pageAFront = !root.pageAFront;
+        root.pagerTransitioning = false;
+
+        if (root.pane === "keyboard")
+            root.pagerVisible = false;
+
+        if (root.queuedPane !== "") {
+            const queued = root.queuedPane;
+            root.queuedPane = "";
+            if (queued !== root.pane)
+                Qt.callLater(() => root.transitionTo(queued));
+        }
+    }
+
+    function transitionTo(nextPane: string): void {
+        if (nextPane !== "keyboard" && nextPane !== "clipboard" &&
+                nextPane !== "emoji" && nextPane !== "history")
+            return;
+        if (root.pagerTransitioning) {
+            root.queuedPane = nextPane;
+            return;
+        }
+        if (nextPane === root.pane)
+            return;
+
         root.paneQuery = "";
         root.searchActive = false;
+
+        const oldIndex = root.paneIndex(root.pane);
+        const newIndex = root.paneIndex(nextPane);
+        const direction = newIndex > oldIndex ? 1 : -1;
+        const outgoing = root.pageAFront ? pageA : pageB;
+        const incoming = root.pageAFront ? pageB : pageA;
+        const travel = Math.max(1, auxiliaryPane.width);
+
+        root.pagerVisible = true;
+        outgoing.visible = true;
+        outgoing.animateX = false;
+        outgoing.x = 0;
+        incoming.visible = true;
+        incoming.animateX = false;
+        incoming.pageMode = nextPane;
+        incoming.x = direction * travel;
+
         root.pane = nextPane;
         paneRefresh.restart();
+        root.pagerTransitioning = true;
+
+        Qt.callLater(() => {
+            outgoing.animateX = true;
+            incoming.animateX = true;
+            outgoing.x = -direction * travel;
+            incoming.x = 0;
+            pagerFinish.restart();
+        });
     }
 
     function runToolbar(action: string): void {
         if (action === "layer") {
             root.searchActive = false;
             if (root.pane !== "keyboard") {
-                root.pane = "keyboard";
                 root.nativeLayer = "keyboard";
                 Quickshell.execDetached([root.tabletBin, "toolbar", "keyboard"]);
+                root.transitionTo("keyboard");
             } else if (root.nativeLayer === "keyboard") {
                 root.nativeLayer = "tools";
                 Quickshell.execDetached([root.tabletBin, "toolbar", "tools"]);
@@ -150,19 +244,13 @@ ShellRoot {
                 root.nativeLayer = "keyboard";
                 Quickshell.execDetached([root.tabletBin, "toolbar", "keyboard"]);
             }
-        } else if (action === "clipboard" || action === "emoji") {
-            root.openPane(action);
-        } else if (action === "history") {
-            // Protocol7 history is a drawer above the real keyboard. Keep the
-            // native alphabet layer and OSK alive instead of covering it.
-            root.nativeLayer = "keyboard";
-            Quickshell.execDetached([root.tabletBin, "toolbar", "keyboard"]);
-            Quickshell.execDetached([root.tabletBin, "osk", "show"]);
-            root.openPane("history");
+        } else if (action === "clipboard" || action === "emoji" || action === "history") {
+            root.transitionTo(action);
         } else if (action === "mic") {
             if (root.actionBin !== "")
                 Quickshell.execDetached([root.actionBin, "protocol7"]);
-            keepKeyboardVisible.restart();
+            keyboardGuard.remaining = 4;
+            keyboardGuard.restart();
         }
     }
 
@@ -217,27 +305,22 @@ ShellRoot {
     }
 
     Timer {
-        id: keepKeyboardVisible
-        interval: 180
+        id: pagerFinish
+        interval: 235
         repeat: false
-        onTriggered: Quickshell.execDetached([root.tabletBin, "osk", "show"])
+        onTriggered: root.finishPagerTransition()
     }
 
     Timer {
-        id: historyInsertDelay
-        interval: 100
-        repeat: false
+        id: keyboardGuard
+        property int remaining: 0
+        interval: 140
+        repeat: true
         onTriggered: {
-            if (root.actionBin !== "" && root.pendingHistoryId !== "") {
-                Quickshell.execDetached([
-                    root.actionBin,
-                    "dictation-insert",
-                    root.pendingHistoryId,
-                    root.pendingHistoryTimestamp
-                ]);
-            }
-            root.pendingHistoryId = "";
-            root.pendingHistoryTimestamp = "";
+            Quickshell.execDetached([root.tabletBin, "osk", "show"]);
+            remaining -= 1;
+            if (remaining <= 0)
+                stop();
         }
     }
 
@@ -368,12 +451,496 @@ ShellRoot {
         }
     }
 
+
+    Component {
+        id: modePageComponent
+
+        Item {
+            id: page
+
+            property string mode: "keyboard"
+            readonly property bool current: root.pane === page.mode
+            readonly property real headerHeight: page.mode === "emoji" ? 94 : 54
+            readonly property real searchPadHeight: root.searchActive && page.current
+                ? Math.max(150, height * 0.44)
+                : 0
+
+            Rectangle {
+                anchors.fill: parent
+                color: page.mode === "keyboard" ? "transparent" : root.toolbarSurface
+            }
+
+            Item {
+                anchors.fill: parent
+                visible: page.mode !== "keyboard"
+
+                Rectangle {
+                    id: searchBox
+                    anchors.left: parent.left
+                    anchors.right: parent.right
+                    anchors.top: parent.top
+                    anchors.leftMargin: 12
+                    anchors.rightMargin: 12
+                    anchors.topMargin: 8
+                    height: 38
+                    radius: 19
+                    color: root.toolbarKey
+
+                    Text {
+                        anchors.left: parent.left
+                        anchors.leftMargin: 13
+                        anchors.verticalCenter: parent.verticalCenter
+                        text: "search"
+                        color: root.toolbarMuted
+                        font.family: "Material Symbols Rounded"
+                        font.pixelSize: 19
+                    }
+
+                    TextInput {
+                        anchors.left: parent.left
+                        anchors.right: clearSearch.left
+                        anchors.leftMargin: 42
+                        anchors.rightMargin: 8
+                        anchors.verticalCenter: parent.verticalCenter
+                        text: page.current ? root.paneQuery : ""
+                        readOnly: true
+                        color: root.toolbarText
+                        font.pixelSize: 14
+                        clip: true
+                        selectByMouse: false
+
+                        Text {
+                            visible: parent.text.length === 0
+                            anchors.verticalCenter: parent.verticalCenter
+                            text: page.mode === "emoji"
+                                ? "Search emojis"
+                                : page.mode === "history"
+                                    ? "Search Protocol 7 history"
+                                    : "Search clipboard"
+                            color: root.toolbarMuted
+                            font.pixelSize: 14
+                        }
+
+                        MouseArea {
+                            anchors.fill: parent
+                            onClicked: {
+                                if (page.current)
+                                    root.searchActive = true;
+                            }
+                        }
+                    }
+
+                    Item {
+                        id: clearSearch
+                        anchors.right: parent.right
+                        anchors.verticalCenter: parent.verticalCenter
+                        anchors.rightMargin: 7
+                        width: 32
+                        height: 32
+
+                        Text {
+                            anchors.centerIn: parent
+                            text: page.current && root.paneQuery.length ? "close" : "search"
+                            color: root.toolbarMuted
+                            font.family: "Material Symbols Rounded"
+                            font.pixelSize: 18
+                        }
+
+                        MouseArea {
+                            anchors.fill: parent
+                            onClicked: {
+                                if (!page.current)
+                                    return;
+                                if (root.paneQuery.length)
+                                    root.paneQuery = "";
+                                else
+                                    root.searchActive = true;
+                            }
+                        }
+                    }
+                }
+
+                ListView {
+                    id: emojiCategoryBar
+                    visible: page.mode === "emoji"
+                    anchors.left: parent.left
+                    anchors.right: parent.right
+                    anchors.top: searchBox.bottom
+                    anchors.topMargin: 4
+                    height: 42
+                    orientation: ListView.Horizontal
+                    spacing: 4
+                    clip: true
+                    leftMargin: 10
+                    rightMargin: 10
+                    model: root.emojiCategories
+
+                    delegate: Rectangle {
+                        required property var modelData
+                        width: 42
+                        height: 34
+                        radius: 17
+                        color: root.emojiCategory === modelData.id ? root.toolbarKey : "transparent"
+
+                        Text {
+                            anchors.centerIn: parent
+                            text: modelData.icon
+                            color: root.toolbarText
+                            font.family: "Material Symbols Rounded"
+                            font.pixelSize: 19
+                        }
+
+                        MouseArea {
+                            anchors.fill: parent
+                            onClicked: {
+                                if (!page.current)
+                                    return;
+                                root.emojiCategory = modelData.id;
+                                root.emojiItems = [];
+                                root.emojiNext = null;
+                            }
+                        }
+                    }
+                }
+
+                Item {
+                    id: resultsArea
+                    anchors.left: parent.left
+                    anchors.right: parent.right
+                    anchors.top: parent.top
+                    anchors.topMargin: page.headerHeight
+                    anchors.bottom: searchPad.top
+                    clip: true
+
+                    Item {
+                        anchors.fill: parent
+                        visible: page.mode === "clipboard"
+
+                        Text {
+                            visible: !root.clipboardAvailable || root.clipItems.length === 0
+                            anchors.centerIn: parent
+                            text: root.clipboardAvailable
+                                ? "No clipboard matches"
+                                : "Clipboard history unavailable"
+                            color: root.toolbarMuted
+                            font.pixelSize: 14
+                        }
+
+                        ListView {
+                            anchors.fill: parent
+                            anchors.leftMargin: 10
+                            anchors.rightMargin: 10
+                            anchors.bottomMargin: 8
+                            spacing: 7
+                            clip: true
+                            model: root.clipItems
+
+                            delegate: Rectangle {
+                                required property var modelData
+                                width: ListView.view.width
+                                height: Math.max(56, clipPreview.implicitHeight + 20)
+                                radius: 12
+                                color: clipArea.pressed
+                                    ? root.toolbarKey
+                                    : Qt.rgba(1, 1, 1, 0.035)
+
+                                Text {
+                                    id: clipPreview
+                                    anchors.left: parent.left
+                                    anchors.right: parent.right
+                                    anchors.verticalCenter: parent.verticalCenter
+                                    anchors.margins: 12
+                                    text: modelData.preview
+                                    textFormat: Text.PlainText
+                                    wrapMode: Text.Wrap
+                                    maximumLineCount: 3
+                                    elide: Text.ElideRight
+                                    color: root.toolbarText
+                                    font.pixelSize: 13
+                                }
+
+                                MouseArea {
+                                    id: clipArea
+                                    anchors.fill: parent
+                                    onClicked: {
+                                        if (page.current && root.actionBin !== "")
+                                            Quickshell.execDetached([
+                                                root.actionBin,
+                                                "clipboard-paste",
+                                                modelData.id
+                                            ]);
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    Item {
+                        anchors.fill: parent
+                        visible: page.mode === "emoji"
+
+                        Text {
+                            visible: root.emojiItems.length === 0 && !emojiList.running
+                            anchors.centerIn: parent
+                            text: "No emoji matches"
+                            color: root.toolbarMuted
+                            font.pixelSize: 14
+                        }
+
+                        GridView {
+                            anchors.fill: parent
+                            anchors.leftMargin: 8
+                            anchors.rightMargin: 8
+                            anchors.bottomMargin: 8
+                            clip: true
+                            cellWidth: 50
+                            cellHeight: 50
+                            model: root.emojiItems
+
+                            onContentYChanged: {
+                                if (page.current && contentY + height >= contentHeight - 140)
+                                    root.loadMoreEmoji();
+                            }
+
+                            delegate: Rectangle {
+                                required property var modelData
+                                width: 44
+                                height: 44
+                                radius: 11
+                                color: emojiArea.pressed ? root.toolbarKey : "transparent"
+
+                                Text {
+                                    anchors.centerIn: parent
+                                    text: modelData.emoji
+                                    font.pixelSize: 25
+                                    font.family: "Noto Color Emoji"
+                                }
+
+                                MouseArea {
+                                    id: emojiArea
+                                    anchors.fill: parent
+                                    onClicked: {
+                                        if (page.current && root.actionBin !== "")
+                                            Quickshell.execDetached([
+                                                root.actionBin,
+                                                "emoji",
+                                                modelData.emoji
+                                            ]);
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    Item {
+                        anchors.fill: parent
+                        visible: page.mode === "history"
+
+                        Text {
+                            visible: root.historyItems.length === 0 && !historyList.running
+                            anchors.centerIn: parent
+                            text: "No dictation history matches"
+                            color: root.toolbarMuted
+                            font.pixelSize: 14
+                        }
+
+                        ListView {
+                            anchors.fill: parent
+                            anchors.leftMargin: 10
+                            anchors.rightMargin: 10
+                            anchors.bottomMargin: 8
+                            spacing: 7
+                            clip: true
+                            model: root.historyItems
+
+                            delegate: Rectangle {
+                                required property var modelData
+                                width: ListView.view.width
+                                height: Math.max(70, historyText.implicitHeight + 34)
+                                radius: 12
+                                color: historyArea.pressed
+                                    ? root.toolbarKey
+                                    : Qt.rgba(1, 1, 1, 0.035)
+
+                                Text {
+                                    anchors.left: parent.left
+                                    anchors.right: parent.right
+                                    anchors.top: parent.top
+                                    anchors.leftMargin: 12
+                                    anchors.rightMargin: 12
+                                    anchors.topMargin: 8
+                                    text: new Date(modelData.timestamp * 1000)
+                                        .toLocaleString(Qt.locale(), Locale.ShortFormat)
+                                    color: root.toolbarMuted
+                                    font.pixelSize: 11
+                                }
+
+                                Text {
+                                    id: historyText
+                                    anchors.left: parent.left
+                                    anchors.right: parent.right
+                                    anchors.bottom: parent.bottom
+                                    anchors.leftMargin: 12
+                                    anchors.rightMargin: 12
+                                    anchors.bottomMargin: 9
+                                    text: modelData.text
+                                    textFormat: Text.PlainText
+                                    wrapMode: Text.Wrap
+                                    maximumLineCount: 4
+                                    elide: Text.ElideRight
+                                    color: root.toolbarText
+                                    font.pixelSize: 13
+                                }
+
+                                MouseArea {
+                                    id: historyArea
+                                    anchors.fill: parent
+                                    onClicked: {
+                                        if (page.current && root.actionBin !== "")
+                                            Quickshell.execDetached([
+                                                root.actionBin,
+                                                "dictation-insert",
+                                                String(modelData.id),
+                                                String(modelData.timestamp)
+                                            ]);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                Item {
+                    id: searchPad
+                    anchors.left: parent.left
+                    anchors.right: parent.right
+                    anchors.bottom: parent.bottom
+                    height: page.searchPadHeight
+                    visible: root.searchActive && page.current
+                    clip: true
+
+                    Rectangle {
+                        anchors.fill: parent
+                        color: root.toolbarSurface
+                    }
+
+                    Column {
+                        anchors.fill: parent
+                        anchors.leftMargin: 10
+                        anchors.rightMargin: 10
+                        anchors.topMargin: 7
+                        anchors.bottomMargin: 7
+                        spacing: 5
+
+                        Repeater {
+                            model: ["qwertyuiop", "asdfghjkl", "zxcvbnm"]
+
+                            delegate: Row {
+                                required property string modelData
+                                width: parent.width
+                                height: (searchPad.height - 43 - 29) / 3
+                                spacing: 4
+                                anchors.horizontalCenter: parent.horizontalCenter
+
+                                Repeater {
+                                    model: modelData.length
+
+                                    delegate: Rectangle {
+                                        required property int index
+                                        width: (parent.width - (modelData.length - 1) * parent.spacing)
+                                            / modelData.length
+                                        height: parent.height
+                                        radius: 8
+                                        color: letterArea.pressed
+                                            ? root.toolbarText
+                                            : root.toolbarKey
+
+                                        Text {
+                                            anchors.centerIn: parent
+                                            text: modelData.charAt(index)
+                                            color: letterArea.pressed
+                                                ? root.toolbarSurface
+                                                : root.toolbarText
+                                            font.pixelSize: 15
+                                        }
+
+                                        MouseArea {
+                                            id: letterArea
+                                            anchors.fill: parent
+                                            onClicked: {
+                                                if (root.paneQuery.length < 96)
+                                                    root.paneQuery += modelData.charAt(index);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        Row {
+                            width: parent.width
+                            height: 38
+                            spacing: 5
+
+                            Repeater {
+                                model: [
+                                    { id: "clear", label: "Clear", weight: 1.0 },
+                                    { id: "space", label: "Space", weight: 2.2 },
+                                    { id: "backspace", label: "⌫", weight: 1.0 },
+                                    { id: "done", label: "Done", weight: 1.0 }
+                                ]
+
+                                delegate: Rectangle {
+                                    required property var modelData
+                                    readonly property real unitWidth:
+                                        (parent.width - parent.spacing * 3) / 5.2
+                                    width: unitWidth * modelData.weight
+                                    height: parent.height
+                                    radius: 9
+                                    color: actionArea.pressed
+                                        ? root.toolbarText
+                                        : root.toolbarKey
+
+                                    Text {
+                                        anchors.centerIn: parent
+                                        text: modelData.label
+                                        color: actionArea.pressed
+                                            ? root.toolbarSurface
+                                            : root.toolbarText
+                                        font.pixelSize: 13
+                                    }
+
+                                    MouseArea {
+                                        id: actionArea
+                                        anchors.fill: parent
+                                        onClicked: {
+                                            if (modelData.id === "clear") {
+                                                root.paneQuery = "";
+                                            } else if (modelData.id === "space") {
+                                                if (root.paneQuery.length < 96)
+                                                    root.paneQuery += " ";
+                                            } else if (modelData.id === "backspace") {
+                                                root.paneQuery = root.paneQuery.slice(0, -1);
+                                            } else if (modelData.id === "done") {
+                                                root.searchActive = false;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     PanelWindow {
         id: auxiliaryPane
-        visible: root.toolbarVisible && (root.pane === "clipboard" || root.pane === "emoji")
+        visible: root.toolbarVisible && root.pagerVisible
         screen: win.screen
         WlrLayershell.layer: WlrLayer.Overlay
-        WlrLayershell.namespace: "yoga-osk-auxiliary"
+        WlrLayershell.namespace: "yoga-osk-pager"
         WlrLayershell.keyboardFocus: WlrKeyboardFocus.None
         anchors.left: true
         anchors.right: true
@@ -382,628 +949,62 @@ ShellRoot {
         margins.bottom: 0
         implicitHeight: root.toolbarBottom
         exclusionMode: ExclusionMode.Ignore
-        color: root.toolbarSurface
+        color: "transparent"
 
-        readonly property real headerHeight: root.pane === "emoji" ? 94 : 54
-        readonly property real searchPadHeight: root.searchActive ? Math.max(150, height * 0.44) : 0
+        Loader {
+            id: pageA
+            property string pageMode: "keyboard"
+            property bool animateX: false
+            x: 0
+            y: 0
+            width: auxiliaryPane.width
+            height: auxiliaryPane.height
+            visible: true
+            sourceComponent: modePageComponent
 
-        Rectangle {
-            id: searchBox
-            anchors.left: parent.left
-            anchors.right: parent.right
-            anchors.top: parent.top
-            anchors.leftMargin: 12
-            anchors.rightMargin: 12
-            anchors.topMargin: 8
-            height: 38
-            radius: 19
-            color: root.toolbarKey
-
-            Text {
-                anchors.left: parent.left
-                anchors.leftMargin: 13
-                anchors.verticalCenter: parent.verticalCenter
-                text: "search"
-                color: root.toolbarMuted
-                font.family: "Material Symbols Rounded"
-                font.pixelSize: 19
+            onLoaded: item.mode = pageMode
+            onPageModeChanged: {
+                if (item)
+                    item.mode = pageMode;
             }
 
-            TextInput {
-                id: searchInput
-                anchors.left: parent.left
-                anchors.right: clearSearch.left
-                anchors.leftMargin: 42
-                anchors.rightMargin: 8
-                anchors.verticalCenter: parent.verticalCenter
-                text: root.paneQuery
-                readOnly: true
-                color: root.toolbarText
-                font.pixelSize: 14
-                clip: true
-                selectByMouse: false
-
-                Text {
-                    visible: root.paneQuery.length === 0
-                    anchors.verticalCenter: parent.verticalCenter
-                    text: root.pane === "emoji"
-                        ? "Search emojis"
-                        : root.pane === "history" ? "Search dictation history" : "Search clipboard"
-                    color: root.toolbarMuted
-                    font.pixelSize: 14
-                }
-
-                MouseArea {
-                    anchors.fill: parent
-                    onClicked: root.searchActive = true
-                }
-            }
-
-            Item {
-                id: clearSearch
-                anchors.right: parent.right
-                anchors.verticalCenter: parent.verticalCenter
-                anchors.rightMargin: 7
-                width: 32
-                height: 32
-
-                Text {
-                    anchors.centerIn: parent
-                    text: root.paneQuery.length ? "close" : "search"
-                    color: root.toolbarMuted
-                    font.family: "Material Symbols Rounded"
-                    font.pixelSize: 18
-                }
-
-                MouseArea {
-                    anchors.fill: parent
-                    onClicked: {
-                        if (root.paneQuery.length)
-                            root.paneQuery = "";
-                        else
-                            root.searchActive = true;
-                    }
+            Behavior on x {
+                enabled: pageA.animateX
+                NumberAnimation {
+                    duration: 230
+                    easing.type: Easing.OutCubic
                 }
             }
         }
 
-        ListView {
-            id: emojiCategoryBar
-            visible: root.pane === "emoji"
-            anchors.left: parent.left
-            anchors.right: parent.right
-            anchors.top: searchBox.bottom
-            anchors.topMargin: 4
-            height: 42
-            orientation: ListView.Horizontal
-            spacing: 4
-            clip: true
-            leftMargin: 10
-            rightMargin: 10
-            model: root.emojiCategories
+        Loader {
+            id: pageB
+            property string pageMode: "keyboard"
+            property bool animateX: false
+            x: 0
+            y: 0
+            width: auxiliaryPane.width
+            height: auxiliaryPane.height
+            visible: false
+            sourceComponent: modePageComponent
 
-            delegate: Rectangle {
-                required property var modelData
-                width: 42
-                height: 34
-                radius: 17
-                color: root.emojiCategory === modelData.id ? root.toolbarKey : "transparent"
-
-                Text {
-                    anchors.centerIn: parent
-                    text: modelData.icon
-                    color: root.toolbarText
-                    font.family: "Material Symbols Rounded"
-                    font.pixelSize: 19
-                }
-
-                MouseArea {
-                    anchors.fill: parent
-                    onClicked: {
-                        root.emojiCategory = modelData.id;
-                        root.emojiItems = [];
-                        root.emojiNext = null;
-                    }
-                }
-            }
-        }
-
-        Item {
-            id: resultsArea
-            anchors.left: parent.left
-            anchors.right: parent.right
-            anchors.top: parent.top
-            anchors.topMargin: auxiliaryPane.headerHeight
-            anchors.bottom: searchPad.top
-            clip: true
-
-            Item {
-                anchors.fill: parent
-                visible: root.pane === "clipboard"
-
-                Text {
-                    visible: !root.clipboardAvailable || root.clipItems.length === 0
-                    anchors.centerIn: parent
-                    text: root.clipboardAvailable ? "No clipboard matches" : "Clipboard history unavailable"
-                    color: root.toolbarMuted
-                    font.pixelSize: 14
-                }
-
-                ListView {
-                    anchors.fill: parent
-                    anchors.leftMargin: 10
-                    anchors.rightMargin: 10
-                    anchors.bottomMargin: 8
-                    spacing: 7
-                    clip: true
-                    model: root.clipItems
-
-                    delegate: Rectangle {
-                        required property var modelData
-                        width: ListView.view.width
-                        height: Math.max(56, clipPreview.implicitHeight + 20)
-                        radius: 12
-                        color: clipArea.pressed ? root.toolbarKey : Qt.rgba(1, 1, 1, 0.035)
-
-                        Text {
-                            id: clipPreview
-                            anchors.left: parent.left
-                            anchors.right: parent.right
-                            anchors.verticalCenter: parent.verticalCenter
-                            anchors.margins: 12
-                            text: modelData.preview
-                            wrapMode: Text.Wrap
-                            maximumLineCount: 3
-                            elide: Text.ElideRight
-                            color: root.toolbarText
-                            font.pixelSize: 13
-                        }
-
-                        MouseArea {
-                            id: clipArea
-                            anchors.fill: parent
-                            onClicked: {
-                                if (root.actionBin !== "")
-                                    Quickshell.execDetached([root.actionBin, "clipboard-paste", modelData.id]);
-                            }
-                        }
-                    }
-                }
+            onLoaded: item.mode = pageMode
+            onPageModeChanged: {
+                if (item)
+                    item.mode = pageMode;
             }
 
-            Item {
-                anchors.fill: parent
-                visible: root.pane === "emoji"
-
-                Text {
-                    visible: root.emojiItems.length === 0 && !emojiList.running
-                    anchors.centerIn: parent
-                    text: "No emoji matches"
-                    color: root.toolbarMuted
-                    font.pixelSize: 14
-                }
-
-                GridView {
-                    id: emojiGrid
-                    anchors.fill: parent
-                    anchors.leftMargin: 8
-                    anchors.rightMargin: 8
-                    anchors.bottomMargin: 8
-                    clip: true
-                    cellWidth: 50
-                    cellHeight: 50
-                    model: root.emojiItems
-
-                    onContentYChanged: {
-                        if (contentY + height >= contentHeight - 140)
-                            root.loadMoreEmoji();
-                    }
-
-                    delegate: Rectangle {
-                        required property var modelData
-                        width: 44
-                        height: 44
-                        radius: 11
-                        color: emojiArea.pressed ? root.toolbarKey : "transparent"
-
-                        Text {
-                            anchors.centerIn: parent
-                            text: modelData.emoji
-                            font.pixelSize: 25
-                            font.family: "Noto Color Emoji"
-                        }
-
-                        MouseArea {
-                            id: emojiArea
-                            anchors.fill: parent
-                            onClicked: {
-                                if (root.actionBin !== "")
-                                    Quickshell.execDetached([root.actionBin, "emoji", modelData.emoji]);
-                            }
-                        }
-                    }
-                }
-            }
-
-            Item {
-                anchors.fill: parent
-                visible: root.pane === "history"
-
-                Text {
-                    visible: root.historyItems.length === 0 && !historyList.running
-                    anchors.centerIn: parent
-                    text: "No dictation history matches"
-                    color: root.toolbarMuted
-                    font.pixelSize: 14
-                }
-
-                ListView {
-                    anchors.fill: parent
-                    anchors.leftMargin: 10
-                    anchors.rightMargin: 10
-                    anchors.bottomMargin: 8
-                    spacing: 7
-                    clip: true
-                    model: root.historyItems
-
-                    delegate: Rectangle {
-                        required property var modelData
-                        width: ListView.view.width
-                        height: Math.max(70, historyText.implicitHeight + 34)
-                        radius: 12
-                        color: historyArea.pressed ? root.toolbarKey : Qt.rgba(1, 1, 1, 0.035)
-
-                        Text {
-                            anchors.left: parent.left
-                            anchors.right: parent.right
-                            anchors.top: parent.top
-                            anchors.leftMargin: 12
-                            anchors.rightMargin: 12
-                            anchors.topMargin: 8
-                            text: new Date(modelData.timestamp * 1000).toLocaleString(Qt.locale(), Locale.ShortFormat)
-                            color: root.toolbarMuted
-                            font.pixelSize: 11
-                        }
-
-                        Text {
-                            id: historyText
-                            anchors.left: parent.left
-                            anchors.right: parent.right
-                            anchors.bottom: parent.bottom
-                            anchors.leftMargin: 12
-                            anchors.rightMargin: 12
-                            anchors.bottomMargin: 9
-                            text: modelData.text
-                            wrapMode: Text.Wrap
-                            maximumLineCount: 4
-                            elide: Text.ElideRight
-                            color: root.toolbarText
-                            font.pixelSize: 13
-                        }
-
-                        MouseArea {
-                            id: historyArea
-                            anchors.fill: parent
-                            onClicked: {
-                                if (root.actionBin !== "")
-                                    Quickshell.execDetached([
-                                        root.actionBin,
-                                        "dictation-insert",
-                                        String(modelData.id),
-                                        String(modelData.timestamp)
-                                    ]);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        Item {
-            id: searchPad
-            anchors.left: parent.left
-            anchors.right: parent.right
-            anchors.bottom: parent.bottom
-            height: auxiliaryPane.searchPadHeight
-            visible: root.searchActive
-            clip: true
-
-            Rectangle {
-                anchors.fill: parent
-                color: root.toolbarSurface
-            }
-
-            Column {
-                anchors.fill: parent
-                anchors.leftMargin: 10
-                anchors.rightMargin: 10
-                anchors.topMargin: 7
-                anchors.bottomMargin: 7
-                spacing: 5
-
-                Repeater {
-                    model: ["qwertyuiop", "asdfghjkl", "zxcvbnm"]
-
-                    delegate: Row {
-                        required property string modelData
-                        width: parent.width
-                        height: (searchPad.height - 43 - 29) / 3
-                        spacing: 4
-                        anchors.horizontalCenter: parent.horizontalCenter
-
-                        Repeater {
-                            model: modelData.length
-
-                            delegate: Rectangle {
-                                required property int index
-                                width: (parent.width - (modelData.length - 1) * parent.spacing) / modelData.length
-                                height: parent.height
-                                radius: 8
-                                color: letterArea.pressed ? root.toolbarText : root.toolbarKey
-
-                                Text {
-                                    anchors.centerIn: parent
-                                    text: modelData.charAt(index)
-                                    color: letterArea.pressed ? root.toolbarSurface : root.toolbarText
-                                    font.pixelSize: 15
-                                }
-
-                                MouseArea {
-                                    id: letterArea
-                                    anchors.fill: parent
-                                    onClicked: {
-                                        if (root.paneQuery.length < 96)
-                                            root.paneQuery += modelData.charAt(index);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-
-                Row {
-                    width: parent.width
-                    height: 38
-                    spacing: 5
-
-                    Repeater {
-                        model: [
-                            { id: "clear", label: "Clear", weight: 1.0 },
-                            { id: "space", label: "Space", weight: 2.2 },
-                            { id: "backspace", label: "⌫", weight: 1.0 },
-                            { id: "done", label: "Done", weight: 1.0 }
-                        ]
-
-                        delegate: Rectangle {
-                            required property var modelData
-                            readonly property real unitWidth: (parent.width - parent.spacing * 3) / 5.2
-                            width: unitWidth * modelData.weight
-                            height: parent.height
-                            radius: 9
-                            color: actionArea.pressed ? root.toolbarText : root.toolbarKey
-
-                            Text {
-                                anchors.centerIn: parent
-                                text: modelData.label
-                                color: actionArea.pressed ? root.toolbarSurface : root.toolbarText
-                                font.pixelSize: 13
-                            }
-
-                            MouseArea {
-                                id: actionArea
-                                anchors.fill: parent
-                                onClicked: {
-                                    if (modelData.id === "clear") {
-                                        root.paneQuery = "";
-                                    } else if (modelData.id === "space") {
-                                        if (root.paneQuery.length < 96)
-                                            root.paneQuery += " ";
-                                    } else if (modelData.id === "backspace") {
-                                        root.paneQuery = root.paneQuery.slice(0, -1);
-                                    } else if (modelData.id === "done") {
-                                        root.searchActive = false;
-                                    }
-                                }
-                            }
-                        }
-                    }
+            Behavior on x {
+                enabled: pageB.animateX
+                NumberAnimation {
+                    duration: 230
+                    easing.type: Easing.OutCubic
                 }
             }
         }
     }
 
 
-
-    // Protocol7 history deliberately lives above the OSK instead of replacing
-    // its key area. This keeps the full native keyboard usable while browsing
-    // or filtering prior dictations.
-    PanelWindow {
-        id: historyDrawer
-        visible: root.toolbarVisible && root.pane === "history"
-        screen: win.screen
-        WlrLayershell.layer: WlrLayer.Overlay
-        WlrLayershell.namespace: "yoga-osk-protocol7-history"
-        WlrLayershell.keyboardFocus: root.searchActive
-            ? WlrKeyboardFocus.Exclusive
-            : WlrKeyboardFocus.None
-        anchors.left: true
-        anchors.right: true
-        anchors.bottom: true
-        margins.left: root.leftMargin
-        margins.bottom: root.bottomMargin
-        implicitHeight: win.screen !== null
-            ? Math.min(300, Math.max(210, win.screen.height * 0.28))
-            : 250
-        exclusionMode: ExclusionMode.Ignore
-        color: root.toolbarSurface
-
-        Rectangle {
-            id: historySearchBox
-            anchors.left: parent.left
-            anchors.right: parent.right
-            anchors.top: parent.top
-            anchors.leftMargin: 12
-            anchors.rightMargin: 12
-            anchors.topMargin: 10
-            height: 40
-            radius: 20
-            color: root.toolbarKey
-
-            Text {
-                anchors.left: parent.left
-                anchors.leftMargin: 13
-                anchors.verticalCenter: parent.verticalCenter
-                text: "search"
-                color: root.toolbarMuted
-                font.family: "Material Symbols Rounded"
-                font.pixelSize: 19
-            }
-
-            TextInput {
-                id: historySearchInput
-                anchors.left: parent.left
-                anchors.right: historySearchClear.left
-                anchors.leftMargin: 42
-                anchors.rightMargin: 8
-                anchors.verticalCenter: parent.verticalCenter
-                text: root.paneQuery
-                color: root.toolbarText
-                font.pixelSize: 14
-                clip: true
-                selectByMouse: false
-                focus: root.searchActive
-
-                onTextEdited: root.paneQuery = text
-
-                Keys.onReturnPressed: event => {
-                    root.searchActive = false;
-                    focus = false;
-                    event.accepted = true;
-                }
-                Keys.onEscapePressed: event => {
-                    root.searchActive = false;
-                    focus = false;
-                    event.accepted = true;
-                }
-
-                Text {
-                    visible: historySearchInput.text.length === 0
-                    anchors.verticalCenter: parent.verticalCenter
-                    text: "Search Protocol 7 history"
-                    color: root.toolbarMuted
-                    font.pixelSize: 14
-                }
-
-                MouseArea {
-                    anchors.fill: parent
-                    onClicked: {
-                        root.searchActive = true;
-                        Qt.callLater(() => historySearchInput.forceActiveFocus());
-                    }
-                }
-            }
-
-            Item {
-                id: historySearchClear
-                anchors.right: parent.right
-                anchors.verticalCenter: parent.verticalCenter
-                anchors.rightMargin: 7
-                width: 32
-                height: 32
-
-                Text {
-                    anchors.centerIn: parent
-                    text: root.paneQuery.length ? "close" : "search"
-                    color: root.toolbarMuted
-                    font.family: "Material Symbols Rounded"
-                    font.pixelSize: 18
-                }
-
-                MouseArea {
-                    anchors.fill: parent
-                    onClicked: {
-                        if (root.paneQuery.length) {
-                            root.paneQuery = "";
-                        } else {
-                            root.searchActive = true;
-                            Qt.callLater(() => historySearchInput.forceActiveFocus());
-                        }
-                    }
-                }
-            }
-        }
-
-        Text {
-            visible: root.historyItems.length === 0 && !historyList.running
-            anchors.centerIn: parent
-            anchors.verticalCenterOffset: 22
-            text: "No dictation history matches"
-            color: root.toolbarMuted
-            font.pixelSize: 14
-        }
-
-        ListView {
-            anchors.left: parent.left
-            anchors.right: parent.right
-            anchors.top: historySearchBox.bottom
-            anchors.bottom: parent.bottom
-            anchors.leftMargin: 10
-            anchors.rightMargin: 10
-            anchors.topMargin: 8
-            anchors.bottomMargin: 10
-            spacing: 7
-            clip: true
-            model: root.historyItems
-
-            delegate: Rectangle {
-                required property var modelData
-                width: ListView.view.width
-                height: Math.max(66, drawerHistoryText.implicitHeight + 32)
-                radius: 12
-                color: drawerHistoryArea.pressed ? root.toolbarKey : Qt.rgba(1, 1, 1, 0.035)
-
-                Text {
-                    anchors.left: parent.left
-                    anchors.right: parent.right
-                    anchors.top: parent.top
-                    anchors.leftMargin: 12
-                    anchors.rightMargin: 12
-                    anchors.topMargin: 7
-                    text: new Date(modelData.timestamp * 1000).toLocaleString(Qt.locale(), Locale.ShortFormat)
-                    color: root.toolbarMuted
-                    font.pixelSize: 11
-                }
-
-                Text {
-                    id: drawerHistoryText
-                    anchors.left: parent.left
-                    anchors.right: parent.right
-                    anchors.bottom: parent.bottom
-                    anchors.leftMargin: 12
-                    anchors.rightMargin: 12
-                    anchors.bottomMargin: 8
-                    text: modelData.text
-                    wrapMode: Text.Wrap
-                    maximumLineCount: 3
-                    elide: Text.ElideRight
-                    color: root.toolbarText
-                    font.pixelSize: 13
-                }
-
-                MouseArea {
-                    id: drawerHistoryArea
-                    anchors.fill: parent
-                    onClicked: {
-                        root.searchActive = false;
-                        historySearchInput.focus = false;
-                        root.pendingHistoryId = String(modelData.id);
-                        root.pendingHistoryTimestamp = String(modelData.timestamp);
-                        historyInsertDelay.restart();
-                    }
-                }
-            }
-        }
-    }
 
     PanelWindow {
         id: win
@@ -1024,7 +1025,7 @@ ShellRoot {
         anchors.left: true
         anchors.bottom: true
         margins.left: root.leftMargin
-        margins.bottom: root.bottomMargin
+        margins.bottom: root.closing ? root.effectiveBottom : 0
 
         implicitWidth: root.barWidth
         implicitHeight: root.barHeight
