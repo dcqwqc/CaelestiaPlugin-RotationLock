@@ -1471,14 +1471,27 @@ class Daemon:
         # config) may have left devices disabled.
         if not force and not self.cfg.get("disable_pointers_in_tablet", False):
             return
-        names = pointer_names()
-        if not names:
-            return
+
         flag = "true" if enabled else "false"
-        chunk = "\n".join(
-            f"hl.device({{ name = {lua_str(n)}, enabled = {flag} }})" for n in names
-        )
-        hypr_eval_lua(chunk + "\n")
+
+        # A shell/compositor restart can race input-device enumeration. If the
+        # first laptop-mode restore runs too early, retry briefly instead of
+        # leaving keyboard/touchpad stuck in their previous disabled state.
+        attempts = 4 if enabled else 1
+        for attempt in range(attempts):
+            names = pointer_names()
+            if names:
+                chunk = "\n".join(
+                    f"hl.device({{ name = {lua_str(n)}, enabled = {flag} }})"
+                    for n in names
+                )
+                if hypr_eval_lua(chunk + "\n"):
+                    return
+            if attempt + 1 < attempts:
+                time.sleep(0.25)
+
+        if enabled:
+            log("could not restore physical keyboard/touchpad after retries")
 
     # -- policy -------------------------------------------------------------
 

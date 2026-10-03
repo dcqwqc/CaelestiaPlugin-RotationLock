@@ -31,6 +31,20 @@ Item {
         id: daemon
         command: [root.bin, "daemon"]
         running: true
+        onExited: daemonRestart.restart()
+    }
+
+    // QuickShell restarts normally recreate this process, but if the native
+    // daemon itself exits unexpectedly while the shell survives, bring it back
+    // instead of leaving rotation/input recovery dead until the next shell reload.
+    Timer {
+        id: daemonRestart
+        interval: 1200
+        repeat: false
+        onTriggered: {
+            if (!daemon.running)
+                daemon.running = true;
+        }
     }
 
     Process {
