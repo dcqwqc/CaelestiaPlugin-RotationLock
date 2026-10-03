@@ -1,53 +1,33 @@
 # Caelestia Tablet Mode
 
-Convertible-laptop support for Caelestia/Hyprland, packaged as one plugin.
+Convertible-laptop support for Caelestia and Hyprland.
 
-It owns the complete Yoga tablet runtime:
+The plugin provides:
 
-- hinge-driven laptop/tablet mode
-- accelerometer auto-rotation for the panel, touchscreen and pen
-- rotation lock quick toggle
-- on-screen keyboard and swipe handle
-- live Caelestia keyboard theming
-- plugin settings in **Nexus → Plugins → RotationLock (Tablet Mode)**
+- tablet-mode state integration for foldable/convertible hardware
+- accelerometer-driven auto-rotation through all four orientations
+- matching touchscreen and pen transforms
+- rotation lock
+- an on-screen keyboard and tablet-mode input handling
+- optional disabling of physical keyboard/touchpad input while folded
 
-The daemon source, OSK shell and Caelestia integration all live in this
-repository. `~/.local/bin/yoga-tablet` may exist as a compatibility symlink for
-Hyprland keybinds and CLI use; it is not a second copy of the daemon.
+Hardware selection is not tied to a particular laptop model. The runtime discovers the internal display from common internal-panel connector types and uses Hyprland's main-keyboard and touchpad device information instead of vendor-specific input names.
 
-## Install
+## Compatibility names
 
-Install from Caelestia's plugin manager with:
+The historical helper executable is named `yoga-tablet`, and older installations may have state under `~/.config/yoga-tablet`. Those names are retained for compatibility only; the plugin is not restricted to Lenovo Yoga hardware.
 
-`https://github.com/dcqwqc/CaelestiaPlugin-TabletMode`
+## Configuration
 
-or clone it as:
+Use the Caelestia Plugins page for rotation thresholds, auto-rotation, rotation lock behavior, on-screen keyboard options, and folded-input policy. A specific monitor can be selected where automatic internal-panel detection is not suitable.
 
-```sh
-git clone https://github.com/dcqwqc/CaelestiaPlugin-TabletMode \
-  ~/.local/share/caelestia/plugins/CaelestiaPlugin-TabletMode
-```
+## Legacy helper commands
 
-Enable `dcqwqc/tabletmode` in the Plugins page.
+Existing integrations can continue using:
 
-## Settings
+    yoga-tablet status
+    yoga-tablet toggle-lock
+    yoga-tablet rotate next
+    yoga-tablet osk toggle
 
-The plugin stores user-facing configuration in
-`~/.config/caelestia/plugins.json` under `dcqwqc/tabletmode`. The daemon reads
-those values directly and reloads them live.
-
-The old `~/.config/yoga-tablet/config.json` format is read only as a migration
-fallback and is no longer written.
-
-## CLI
-
-```sh
-yoga-tablet status
-yoga-tablet toggle-lock
-yoga-tablet rotate next
-yoga-tablet osk toggle
-```
-
-## Licence
-
-GPL-3.0-or-later.
+These are compatibility entry points to the plugin-owned runtime.

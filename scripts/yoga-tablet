@@ -1,15 +1,9 @@
 #!/usr/bin/env python3
-"""yoga-tablet - convertible support for Hyprland on the Lenovo Yoga 7 2-in-1.
+"""Convertible-device support for Hyprland.
 
-Three things the compositor does not do on its own:
-
-  * Accelerometer-driven rotation of the internal panel through all four
-    orientations, applied to the output *and* to the touchscreen and pen
-    digitizers so that touch stays aligned with what is on screen.
-  * A reaction to the "Lenovo Yoga Tablet Mode Control switch" (the hinge
-    passing ~190 deg), which is what folding the keyboard away reports.
-  * An on-screen keyboard, so the machine stays usable once the physical
-    keyboard is folded underneath and deactivated.
+The runtime provides accelerometer-driven display/digitizer rotation, reacts to
+tablet-mode state supplied by the platform integration, and supervises an
+on-screen keyboard for folded convertible use.
 
 Hyprland 0.56 with a Lua config rejects `hyprctl keyword` ("keyword can't
 work with non-legacy parsers"), so every compositor change is issued as a
@@ -528,7 +522,8 @@ def pick_monitor(cfg: dict):
                 return mon
         log(f"configured monitor {want!r} not present; falling back to internal")
     for mon in monitors:
-        if str(mon.get("name", "")).lower().startswith("edp"):
+        name = str(mon.get("name", "")).lower()
+        if name.startswith(("edp", "lvds", "dsi")):
             return mon
     return monitors[0]
 
@@ -555,11 +550,12 @@ def pointer_names() -> list[str]:
     names = []
     for dev in devices.get("mice") or []:
         name = dev.get("name") or ""
-        if "touchpad" in name or "elan" in name:
+        if "touchpad" in name.lower():
             names.append(name)
-    for dev in devices.get("keyboards") or []:
+    keyboards = devices.get("keyboards") or []
+    for dev in keyboards:
         name = dev.get("name") or ""
-        if "at-translated-set-2-keyboard" in name:
+        if name and bool(dev.get("main")):
             names.append(name)
     return names
 
@@ -1228,7 +1224,7 @@ class Daemon:
         try:
             tmp = OSK_STATE_PATH.with_suffix(".tmp")
             with tmp.open("w") as fh:
-                json.dump({"visible": visible, "inset": inset}, fh)
+                json.dump({"visible": visible, "inset": inset, "tablet_mode": self.tablet_mode}, fh)
                 fh.write("\n")
             tmp.replace(OSK_STATE_PATH)
         except OSError as exc:
@@ -1550,7 +1546,7 @@ def send(req: dict, timeout: float = 5.0) -> dict:
 def main() -> int:
     parser = argparse.ArgumentParser(
         prog=APP,
-        description="Tablet mode and screen auto-rotation for Hyprland on a Lenovo Yoga.",
+        description="Tablet mode, screen auto-rotation, and on-screen keyboard support for Hyprland convertibles.",
     )
     sub = parser.add_subparsers(dest="cmd", required=True)
 

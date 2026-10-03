@@ -68,7 +68,7 @@ SettingsObject {
     property bool disablePointersInTablet: false
     SettingMeta on disablePointersInTablet {
         label: "Disable keyboard and touchpad in tablet mode"
-        description: "Normally the Yoga firmware handles this. Enable only if your firmware leaves physical input active while folded."
+        description: "Most convertible firmware disables physical input while folded. Enable only if your device leaves the keyboard or touchpad active in tablet mode."
         icon: "keyboard_off"
         inputType: SettingMeta.Switch
     }

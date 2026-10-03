@@ -7,7 +7,7 @@ import dcqwqc.tabletmode.services as RotationLockPlugin
 // hinge), so this re-reads whenever it comes back on screen rather than polling
 // for a change that almost never happens.
 IconButton {
-    // Hides itself where the yoga-tablet daemon is not answering, rather
+    // Hides itself where the tablet-mode daemon is not answering, rather
     // than sitting there as a dead control on a desktop.
     visible: RotationLockPlugin.RotationLock.available
     icon: RotationLockPlugin.RotationLock.locked ? "screen_lock_rotation" : "screen_rotation"

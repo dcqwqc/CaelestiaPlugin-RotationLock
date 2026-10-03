@@ -5,7 +5,7 @@ import Quickshell
 import Quickshell.Io
 import qs.utils
 
-// Rotation lock, as owned by the yoga-tablet daemon.
+// Rotation lock, as owned by the tablet-mode runtime.
 //
 // The daemon is the authority: it also flips the lock from the CLI
 // (Super+Alt+O rotates and latches) and from its own tablet-mode handling, so
