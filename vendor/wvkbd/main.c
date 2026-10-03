@@ -85,6 +85,11 @@ static bool im_auto = false;
 static int control_fd = -1;
 static int32_t horizontal_offset = 0;
 static int32_t vertical_offset = 0;
+/* Keep the native keyboard inside the same left viewport used by the QML
+ * utility pager. The layer surface normally starts ~8 logical px before that
+ * viewport on Caelestia, so balancing +8/-8 preserves its width while moving
+ * the hard clip edge to the pager boundary. */
+static const int32_t shell_clip_inset = 8;
 
 /* event handler prototypes */
 static void wl_pointer_enter(void *data, struct wl_pointer *wl_pointer,
@@ -607,16 +612,21 @@ layer_surface_configure(void *data, struct zwlr_layer_surface_v1 *surface,
         return;
     };
 
-    // Not what we expected, or redimension, refresh and restart
-    if (keyboard.w != w || keyboard.h != h) {
+    // During a clipped horizontal page transition the compositor correctly
+    // configures a narrower surface. Keep the full keyboard layout/buffer and
+    // merely acknowledge that temporary width instead of rebuilding wvkbd.
+    if (keyboard.h != h ||
+        (keyboard.w != w &&
+         !(horizontal_offset < 0 && w > 0 && w < keyboard.w))) {
         zwlr_layer_surface_v1_ack_configure(surface, serial);
         hide();
         show();
         return;
     };
 
-    // Swallow useless events
+    // Reconfiguration after margin/viewport changes still needs an ack.
     if (layer_surface_configured) {
+        zwlr_layer_surface_v1_ack_configure(surface, serial);
         return;
     };
     layer_surface_configured = true;
@@ -753,6 +763,7 @@ list_capabilities(void)
     puts("control-fd");
     puts("horizontal-offset");
     puts("vertical-offset");
+    puts("shell-clip");
     puts("primary-touch");
     puts("long-press-alternates");
     puts("layer-signals");
@@ -854,8 +865,11 @@ show()
 
     zwlr_layer_surface_v1_set_size(layer_surface, 0, height);
     zwlr_layer_surface_v1_set_anchor(layer_surface, anchor);
-    zwlr_layer_surface_v1_set_margin(layer_surface, 0, -horizontal_offset,
-                                     vertical_offset, horizontal_offset);
+    zwlr_layer_surface_v1_set_margin(
+        layer_surface, 0,
+        -shell_clip_inset - horizontal_offset,
+        vertical_offset,
+        shell_clip_inset + horizontal_offset);
     if (keyboard.exclusive) {
         zwlr_layer_surface_v1_set_exclusive_zone(layer_surface, height);
     }
@@ -882,7 +896,49 @@ set_surface_offset(int32_t x, int32_t y)
     if (!layer_surface)
         return;
 
-    zwlr_layer_surface_v1_set_margin(layer_surface, 0, -x, y, x);
+    /* For leftward page transitions, keep the layer surface itself pinned to
+     * the pager's left boundary and crop the buffer through wp_viewporter.
+     * This is the native equivalent of QML Item.clip: keyboard pixels never
+     * enter the transparent QuickShell strip. */
+    if (x <= 0 && draw_surf_viewport && layer_surface_configured &&
+        keyboard.w > 1) {
+        uint32_t shift = (uint32_t)(-x);
+        if (shift >= keyboard.w)
+            shift = keyboard.w - 1;
+
+        double scale = keyboard.preferred_fractional_scale
+            ? keyboard.preferred_fractional_scale
+            : keyboard.scale;
+        if (scale <= 0)
+            scale = 1;
+
+        uint32_t visible_w = keyboard.w - shift;
+        wp_viewport_set_source(
+            draw_surf_viewport,
+            wl_fixed_from_double((double)shift * scale),
+            wl_fixed_from_double(0),
+            wl_fixed_from_double((double)visible_w * scale),
+            wl_fixed_from_double((double)keyboard.h * scale));
+        wp_viewport_set_destination(draw_surf_viewport, visible_w, keyboard.h);
+
+        zwlr_layer_surface_v1_set_margin(
+            layer_surface, 0,
+            -shell_clip_inset + (int32_t)shift,
+            y, shell_clip_inset);
+    } else {
+        if (draw_surf_viewport && keyboard.w > 0 && keyboard.h > 0) {
+            wp_viewport_set_source(
+                draw_surf_viewport,
+                wl_fixed_from_int(-1), wl_fixed_from_int(-1),
+                wl_fixed_from_int(-1), wl_fixed_from_int(-1));
+            wp_viewport_set_destination(
+                draw_surf_viewport, keyboard.w, keyboard.h);
+        }
+        zwlr_layer_surface_v1_set_margin(
+            layer_surface, 0,
+            -shell_clip_inset - x,
+            y, shell_clip_inset + x);
+    }
     wl_surface_commit(draw_surf.surf);
 }
 

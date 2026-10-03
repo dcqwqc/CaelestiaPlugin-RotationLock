@@ -90,3 +90,15 @@ Existing integrations can continue using:
     yoga-tablet osk toggle
 
 These are compatibility entry points to the plugin-owned runtime.
+
+## Hyprland layer integration
+
+Horizontal native-keyboard paging is hard-clipped at the same left boundary as
+the QML utility pager. The patched wvkbd keeps its layer surface pinned there
+and uses wp_viewporter source cropping while the buffer moves left; keyboard
+pixels therefore never render inside the transparent QuickShell edge strip.
+
+On Hyprland, keeping the wvkbd layer rule at no_anim = true, order = -10 is
+also recommended. The negative order keeps the native surface behind Caelestia's
+other top-layer surfaces, while the hard clip prevents transparent shell regions
+from revealing keyboard pixels during a page transition.
